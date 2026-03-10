@@ -1,0 +1,29 @@
+# This file may be used to create an environment using:
+# $ conda create --name <env> --file <this file>
+# platform: linux-64
+# created-by: conda 26.1.0
+# Note: This is a conda requirements file (MatchSpec format)
+# Contains conda package specifications, not pip requirements
+
+python==3.12
+pip
+mamba
+numpy
+matplotlib
+pytorch
+torchvision
+torchaudio
+transformers
+accelerate
+evaluate
+datasets
+scikit-learn
+notebook
+ipykernel
+ipywidgets
+widgetsnbextension
+jupyterlab
+jupyterlab_widgets
+tqdm
+torchinfo
+optuna

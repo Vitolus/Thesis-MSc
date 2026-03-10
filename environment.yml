@@ -1,0 +1,26 @@
+name: pytorch
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - mamba
+  - numpy
+  - matplotlib
+  - pytorch
+  - torchvision
+  - torchaudio
+  - transformers
+  - accelerate
+  - evaluate
+  - datasets
+  - scikit-learn
+  - notebook
+  - ipykernel
+  - ipywidgets
+  - widgetsnbextension
+  - jupyterlab
+  - jupyterlab_widgets
+  - tqdm
+  - torchinfo
+  - optuna
