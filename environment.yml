@@ -6,6 +6,8 @@ dependencies:
   - pip
   - conda-forge::mamba
   - numpy
+  - pandas
+  - seaborn
   - matplotlib
   - pytorch
   - torchvision
