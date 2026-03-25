@@ -6,8 +6,6 @@ dependencies:
   - pip
   - conda-forge::mamba
   - numpy
-  - pandas
-  - seaborn
   - matplotlib
   - pytorch
   - torchvision
@@ -27,3 +25,6 @@ dependencies:
   - conda-forge::torchinfo
   - optuna
   - pandas-stubs
+  - pandas
+  - seaborn
+  - conda-forge::pysoundfile
