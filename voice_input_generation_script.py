@@ -3,6 +3,7 @@ import torch.multiprocessing as mp
 import os
 import gc
 import argparse
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import soundfile as sf
@@ -118,8 +119,8 @@ def launch_multigpu_job(csv_path, output_dir):
         print("Warning: Only 1 GPU detected. Running sequentially.")
         num_gpus = 1
     # 3. Split the dataframe into equal chunks based on GPU count
-    import numpy as np
-    df_chunks = np.array_split(df, num_gpus)
+    chunk_indices = np.array_split(range(len(df)), num_gpus)
+    df_chunks = [df.iloc[indices] for indices in chunk_indices]
     # 4. Spawn processes
     print(f"Distributing dataset across {num_gpus} GPUs...")
     mp.set_start_method('spawn', force=True)  # Required for CUDA multiprocessing
