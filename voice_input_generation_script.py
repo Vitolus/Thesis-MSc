@@ -1,7 +1,10 @@
 import torch
 import torch.multiprocessing as mp
+import torch._inductor.config
 import os
 import gc
+import warnings
+import logging
 import argparse
 import numpy as np
 import pandas as pd
@@ -24,6 +27,17 @@ if not hasattr(StaticCache, "batch_size"):
 # --- THE WORKER FUNCTION (Runs on each GPU) ---
 def worker_process(gpu_id, df_chunk, output_dir):
     """This function is completely isolated. It loads its own model on its specific GPU."""
+    # Hide OS-level PyTorch C++ logs
+    os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+    os.environ["TORCH_LOGS"] = "-all"
+    # Hide standard Python warnings
+    warnings.filterwarnings("ignore")
+    # Mute PyTorch's internal Python loggers
+    logging.getLogger("torch").setLevel(logging.ERROR)
+    logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+    logging.getLogger("torch.fx").setLevel(logging.ERROR)
+    torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
+
     device = f"cuda:{gpu_id}"
     print(f"[GPU {gpu_id}] Initializing process. Rows to process: {len(df_chunk)}")
     # 1. Enable TF32 for speed
