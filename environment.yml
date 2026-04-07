@@ -15,6 +15,7 @@ dependencies:
   - accelerate
   - evaluate
   - flash-attn
+  - bitsandbytes
   - datasets
   - scikit-learn
   - notebook
