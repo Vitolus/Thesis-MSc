@@ -30,4 +30,4 @@ EOF
 ------------------------
 # for freezing conda env to install pip packages
 
-mamba list | awk '$1 ~ /^[A-Za-z0-9_]/ && $1 != "Name" && $1 != "List" {print $1"=="$2}' > conda_constraints.txt
+mamba list | awk '$1 ~ /^[a-zA-Z0-9]/ && $1 != "Name" && $1 != "List" {print $1"=="$2}' > conda_constraints.txt
