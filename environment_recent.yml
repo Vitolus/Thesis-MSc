@@ -8,7 +8,7 @@ dependencies:
   - mamba
   - torchvision
   - torchaudio
-  - pytorch-gpu=2.9.1
+  - pytorch-gpu>=2.9.1
   - numpy
   - matplotlib
   - transformers
@@ -33,5 +33,4 @@ dependencies:
   - pysoundfile
   - librosa
   - num2words
-  - wandb
   - nvidia::cuda-toolkit
