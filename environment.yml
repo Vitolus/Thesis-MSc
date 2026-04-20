@@ -3,12 +3,13 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.13
+  - python=3.12
   - pip
   - numpy=2.2.6
   - matplotlib
   - transformers
   - accelerate
+  - optimum
   - evaluate
   - datasets
   - scikit-learn
@@ -25,3 +26,4 @@ dependencies:
   - librosa
   - num2words
   - nvidia::cuda-toolkit>=13.0
+  - setuptools<82.0
