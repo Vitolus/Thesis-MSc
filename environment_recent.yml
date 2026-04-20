@@ -9,7 +9,7 @@ dependencies:
   - torchvision
   - torchaudio
   - pytorch-gpu>=2.9.1
-  - numpy
+  - numpy=2.2.6
   - matplotlib
   - transformers
   - accelerate
