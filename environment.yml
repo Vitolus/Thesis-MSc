@@ -1,39 +1,27 @@
-name: pytorch
+name: pyqwen
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.12
+  - python=3.13
   - pip
-  - mamba
-  - torchvision
-  - torchaudio
-  - pytorch-gpu=2.9.1
-  - numpy
+  - numpy=2.2.6
   - matplotlib
-  - transformers=4.46.1
+  - transformers
   - accelerate
   - evaluate
-  - flash-attn
-  - bitsandbytes
   - datasets
   - scikit-learn
-  - notebook
+  - jupyterlab
   - ipykernel
   - ipywidgets
-  - widgetsnbextension
-  - jupyterlab
-  - jupyterlab_widgets
   - tqdm
   - torchinfo
   - optuna
-  - pandas-stubs
   - pandas
+  - pandas-stubs
   - seaborn
   - pysoundfile
   - librosa
   - num2words
-  - wandb
-  - nvidia::cuda-toolkit
-  - pip:
-    - parler-tts
+  - nvidia::cuda-toolkit>=13.0
