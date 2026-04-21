@@ -7,7 +7,6 @@ dependencies:
   - pip
   - numpy=2.2.6
   - matplotlib
-  - llama-cpp-python
   - transformers
   - accelerate
   - optimum
