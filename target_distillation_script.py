@@ -63,7 +63,7 @@ def setup_pipeline(hf_repo, hf_filename):
         repo_id=hf_repo,
         filename=hf_filename,
         n_gpu_layers=-1,
-        n_ctx=1024,
+        n_ctx=2048,
         flash_attn=True,
         n_threads=12,
         offload_kqv=True,
@@ -90,7 +90,7 @@ def process_dataset(args):
             {"role": "user", "content": prompt}
         ]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-        output = llm(text, max_tokens=512, temperature=0.6, min_p=0.0, top_p=0.95, top_k=20, stop=["<|im_end|>"])
+        output = llm(text, max_tokens=1024, temperature=0.6, min_p=0.0, top_p=0.95, top_k=20, stop=["<|im_end|>"])
         raw_output = output['choices'][0]['text'].strip()
         if "</think>" in raw_output:
             return raw_output.split("</think>")[-1].strip()
