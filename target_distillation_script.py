@@ -62,7 +62,6 @@ def setup_pipeline(hf_repo, hf_filename):
     print(f"Loading 32B Model {local_model_path} across all GPUs...")
     llm = Llama(
         model_path=local_model_path,
-        filename=hf_filename,
         n_gpu_layers=-1,
         n_ctx=2048,
         flash_attn=True,
