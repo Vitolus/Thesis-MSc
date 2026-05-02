@@ -58,16 +58,17 @@ def setup_pipeline(hf_repo, hf_filename):
     print(f"Loading Tokenizer from {hf_repo}...")
     tokenizer = AutoTokenizer.from_pretrained(hf_repo)
     tokenizer.chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% if enable_thinking %}{{ '<think>\\n' }}{% endif %}{% endif %}"
-    print(f"Downloading/Loading 32B Model from HF ({hf_repo}/{hf_filename}) across all GPUs...")
+    local_model_path = f"/home/davide.vitagliano/thesis/models/{hf_filename}"
+    print(f"Loading 32B Model {local_model_path} across all GPUs...")
     llm = Llama.from_pretrained(
-        repo_id=hf_repo,
+        model_path=local_model_path,
         filename=hf_filename,
         n_gpu_layers=-1,
         n_ctx=2048,
         flash_attn=True,
         n_threads=12,
         offload_kqv=True,
-        verbose=False
+        verbose=True
     )
     think_token_id = llm.tokenize(b"<think>", special=True)[-1]
     return tokenizer, llm, think_token_id
