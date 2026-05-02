@@ -137,6 +137,9 @@ def process_dataset(args):
         return "ERROR: Model generation failed completely.", 0
 
     df_input = pd.read_csv(args.input_csv)
+    if args.limit > 0:
+        df_input = df_input.iloc[:args.limit]
+        print(f"Limiting processing to the first {args.limit} rows.")
     results = []
     for idx, row in tqdm(df_input.iterrows(), total=len(df_input), desc="Distilling Data"):
         user_cmd = row["User_Command"]
@@ -161,5 +164,6 @@ if __name__ == "__main__":
     parser.add_argument("--output_csv", type=str, required=True, help="Path to save output CSV")
     parser.add_argument("--hf_repo", type=str, required=True, help="Hugging Face Repository")
     parser.add_argument("--hf_filename", type=str, required=True, help="Specific .gguf filename in the repo")
+    parser.add_argument("--limit", type=int, default=0, help="Limit the number of rows processed.")
     args = parser.parse_args()
     process_dataset(args)
