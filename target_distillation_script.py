@@ -68,7 +68,7 @@ def setup_pipeline(hf_repo, hf_filename):
         flash_attn=True,
         n_threads=12,
         offload_kqv=True,
-        verbose=True
+        verbose=False
     )
     think_token_id = llm.tokenize(b"<think>", special=True)[-1]
     return tokenizer, llm, think_token_id
