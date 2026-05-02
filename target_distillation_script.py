@@ -60,7 +60,7 @@ def setup_pipeline(hf_repo, hf_filename):
     tokenizer.chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% if enable_thinking %}{{ '<think>\\n' }}{% endif %}{% endif %}"
     local_model_path = f"/home/davide.vitagliano/thesis/models/{hf_filename}"
     print(f"Loading 32B Model {local_model_path} across all GPUs...")
-    llm = Llama.from_pretrained(
+    llm = Llama(
         model_path=local_model_path,
         filename=hf_filename,
         n_gpu_layers=-1,
