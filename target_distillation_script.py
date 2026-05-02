@@ -66,7 +66,7 @@ def setup_pipeline(hf_repo, hf_filename):
         n_gpu_layers=-1,
         n_ctx=2048,
         flash_attn=False,
-        n_threads=12,
+        n_threads=6,
         offload_kqv=True,
         verbose=False
     )
@@ -142,9 +142,9 @@ def process_dataset(args):
         df_input = df_input.iloc[:args.limit]
         print(f"Limiting processing to the first {args.limit} rows.")
     # Split the dataframe into equal chunks based on total tasks
-    chunks = np.array_split(df_input, args.array_tasks)
+    index_chunks = np.array_split(df_input.index, args.array_tasks)
     # Grab the specific chunk for this specific GPU
-    df_chunk = pd.DataFrame(chunks[args.array_id])
+    df_chunk = df_input.loc[index_chunks[args.array_id]]
     print(f"Worker {args.array_id}: Processing {len(df_chunk)} rows...")
     # Modify the output CSV name so the 4 workers don't overwrite each other!
     worker_output_csv = args.output_csv.replace(".csv", f"_part{args.array_id}.csv")
