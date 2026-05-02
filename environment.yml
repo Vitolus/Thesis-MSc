@@ -7,7 +7,7 @@ dependencies:
   - pip
   - numpy=2.2.6
   - matplotlib
-  - transformers
+  - transformers>=5.5.0
   - accelerate
   - optimum
   - evaluate
@@ -17,7 +17,6 @@ dependencies:
   - ipykernel
   - ipywidgets
   - tqdm
-  - torchinfo
   - optuna
   - pandas
   - pandas-stubs

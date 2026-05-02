@@ -28,6 +28,9 @@ unset OLD_CPLUS_INCLUDE_PATH
 unset OLD_CUDA_HOME
 EOF
 ------------------------
-# for freezing conda env to install pip packages
 
-mamba list | awk '$1 ~ /^[a-zA-Z0-9]/ && $1 != "Name" && $1 != "List" {print $1"=="$2}' > conda_constraints.txt
+# pip package
+
+torch torchvision torchaudio 
+pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_x86_64.whl
+CMAKE_BUILD_PARALLEL_LEVEL=12 CMAKE_ARGS="-DGGML_CUDA=on" pip install --upgrade llama-cpp-python --no-cache-dir
