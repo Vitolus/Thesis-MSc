@@ -64,7 +64,7 @@ def setup_pipeline(hf_repo, hf_filename):
         model_path=local_model_path,
         n_gpu_layers=-1,
         n_ctx=2048,
-        flash_attn=True,
+        flash_attn=False,
         n_threads=12,
         offload_kqv=True,
         verbose=False
