@@ -113,10 +113,15 @@ def process_dataset(args):
             return 0
 
     def apply_sao_selection(user_command, user_emotion, max_retries=3, threshold=7):
-        best_candidate, best_score = None, -1
+        best_candidate = None
+        best_score = -1
+        last_raw_candidate = None
         for _ in range(max_retries):
             candidate = generate_teacher_response(user_command, user_emotion)
-            if not candidate: continue
+            if candidate:
+                last_raw_candidate = candidate
+            else:
+                continue
             if "```" in candidate or "{" in candidate or not re.search(r'<(fast|slow_deadpan|pause|sigh)>', candidate):
                 continue
             score = evaluate_semantic_quality(candidate, user_command, user_emotion)
@@ -125,7 +130,11 @@ def process_dataset(args):
                 best_candidate = candidate
             if score >= threshold:
                 return candidate, score
-        return best_candidate, best_score
+        if best_candidate is not None:
+            return best_candidate, best_score
+        if last_raw_candidate is not None:
+            return last_raw_candidate, 0
+        return "ERROR: Model generation failed completely.", 0
 
     df_input = pd.read_csv(args.input_csv)
     results = []
