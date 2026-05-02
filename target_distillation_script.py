@@ -144,7 +144,7 @@ def process_dataset(args):
     # Split the dataframe into equal chunks based on total tasks
     chunks = np.array_split(df_input, args.array_tasks)
     # Grab the specific chunk for this specific GPU
-    df_chunk = chunks[args.array_id]
+    df_chunk = pd.DataFrame(chunks[args.array_id])
     print(f"Worker {args.array_id}: Processing {len(df_chunk)} rows...")
     # Modify the output CSV name so the 4 workers don't overwrite each other!
     worker_output_csv = args.output_csv.replace(".csv", f"_part{args.array_id}.csv")
