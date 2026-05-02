@@ -6,6 +6,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 from llama_cpp import Llama
 from transformers import AutoTokenizer
+import numpy as np
 import pandas as pd
 import re
 from tqdm import tqdm
@@ -140,23 +141,32 @@ def process_dataset(args):
     if args.limit > 0:
         df_input = df_input.iloc[:args.limit]
         print(f"Limiting processing to the first {args.limit} rows.")
+    # Split the dataframe into equal chunks based on total tasks
+    chunks = np.array_split(df_input, args.array_tasks)
+    # Grab the specific chunk for this specific GPU
+    df_chunk = chunks[args.array_id]
+    print(f"Worker {args.array_id}: Processing {len(df_chunk)} rows...")
+    # Modify the output CSV name so the 4 workers don't overwrite each other!
+    worker_output_csv = args.output_csv.replace(".csv", f"_part{args.array_id}.csv")
+    # Initialize the empty CSV for this specific worker
+    pd.DataFrame(columns=["prompt_id", "cmd_id", "User_Command", "User_Emotion", "Target_GLaDOS_Response",
+                          "Judge_Score"]).to_csv(worker_output_csv, index=False)
     results = []
-    for idx, row in tqdm(df_input.iterrows(), total=len(df_input), desc="Distilling Data"):
+    for idx, row in tqdm(df_chunk.iterrows(), total=len(df_chunk), desc=f"GPU {args.array_id} Distilling"):
         user_cmd = row["User_Command"]
         user_emotion = extract_emotion(row.get("Voice_Description", ""))
         valid_text, judge_score = apply_sao_selection(user_cmd, user_emotion, threshold=7)
         if valid_text is not None:
-            results.append({
+            single_row_df = pd.DataFrame([{
                 "prompt_id": row.get("prompt_id", idx),
                 "cmd_id": row.get("cmd_id", 0),
                 "User_Command": user_cmd,
                 "User_Emotion": user_emotion,
                 "Target_GLaDOS_Response": valid_text,
                 "Judge_Score": judge_score
-            })
-    df_output = pd.DataFrame(results)
-    df_output.to_csv(args.output_csv, index=False)
-    print(f"Successfully saved {len(df_output)} samples to {args.output_csv}")
+            }])
+            single_row_df.to_csv(worker_output_csv, mode='a', header=False, index=False)
+    print(f"Successfully saved worker data to {worker_output_csv}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run LLM Data Distillation on Slurm")
@@ -165,5 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--hf_repo", type=str, required=True, help="Hugging Face Repository")
     parser.add_argument("--hf_filename", type=str, required=True, help="Specific .gguf filename in the repo")
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of rows processed.")
+    parser.add_argument("--array_id", type=int, default=0, help="Slurm Array Task ID")
+    parser.add_argument("--array_tasks", type=int, default=1, help="Total number of Slurm Array tasks")
     args = parser.parse_args()
     process_dataset(args)
