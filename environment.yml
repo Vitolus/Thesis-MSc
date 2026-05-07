@@ -26,3 +26,5 @@ dependencies:
   - num2words
   - nvidia::cuda-toolkit>=13.0
   - setuptools<82.0
+  - peft
+  - trl

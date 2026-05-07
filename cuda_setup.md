@@ -34,3 +34,4 @@ EOF
 torch torchvision torchaudio 
 pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_x86_64.whl
 CMAKE_BUILD_PARALLEL_LEVEL=12 CMAKE_ARGS="-DGGML_CUDA=on" pip install --upgrade llama-cpp-python --no-cache-dir
+pip install --upgrade "mistral-common[audio]"
