@@ -168,7 +168,7 @@ if __name__ == "__main__":
         print(f"Found existing configuration at {params_path}")
         with open(params_path, "r") as f:
             best_params = json.load(f)
-    train_dataset, eval_dataset = create_datasets(df, unique_commands)
+    train_dataset, eval_dataset = create_datasets(df, unique_commands, processor)
     del df, unique_commands
     gc.collect()
     torch.cuda.empty_cache()
@@ -219,8 +219,9 @@ if __name__ == "__main__":
 
     training_args = SFTConfig(
         output_dir=output_dir,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=2,
         per_device_eval_batch_size=4,
+        max_length=1536,
         eval_strategy="steps",
         eval_steps=800,
         save_strategy="steps",
@@ -229,7 +230,7 @@ if __name__ == "__main__":
         load_best_model_at_end=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=8,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=2,
