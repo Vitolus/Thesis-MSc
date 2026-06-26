@@ -56,7 +56,7 @@ def get_prepared_model(model_id, quantization_config, device, compute_dtype, pro
     model = VoxtralForConditionalGeneration.from_pretrained(
         model_id,
         quantization_config=quantization_config,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map=device
     )
     # Prepare model for gradient training
