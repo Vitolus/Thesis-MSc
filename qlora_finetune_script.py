@@ -76,8 +76,15 @@ def get_prepared_model(model_id, quantization_config, device, compute_dtype, pro
     model.config.bos_token_id = processor.tokenizer.bos_token_id
     return model
 
-def make_voxtral_collate_fn(processor):
+def make_voxtral_collate_fn(processor, chat_template):
     def voxtral_collate_fn(batch):
+        # Re-apply dynamic attributes because PyTorch multiprocessing
+        # drops them during Fast Tokenizer serialization.
+        if processor.tokenizer.pad_token is None:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+            processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+        if processor.tokenizer.chat_template is None:
+            processor.tokenizer.chat_template = chat_template
         conversations = [item["messages"] for item in batch]
         inputs = processor.apply_chat_template(
             conversations,
@@ -133,14 +140,30 @@ if __name__ == "__main__":
 
     model_id = "mistralai/Voxtral-Mini-3B-2507"
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    chat_template = (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}[INST] "
+        "{% if message['content'] is string %}{{ message['content'] }}"
+        "{% else %}{% for block in message['content'] %}"
+        "{% if block['type'] == 'text' %}{{ block['text'] }}"
+        "{% elif block['type'] == 'audio' %}<audio>"
+        "{% endif %}{% endfor %}{% endif %} [/INST]"
+        "{% elif message['role'] == 'assistant' %}"
+        "{% if message['content'] is string %}{{ message['content'] }}"
+        "{% else %}{% for block in message['content'] %}"
+        "{% if block['type'] == 'text' %}{{ block['text'] }}"
+        "{% endif %}{% endfor %}{% endif %}"
+        "{% endif %}{% endfor %}"
+    )
     if is_main_process:
         print(f"Loading processor for {model_id}...")
     processor = AutoProcessor.from_pretrained(model_id)
     # Right padding for training
     processor.tokenizer.padding_side = "right"
     if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.unk_token
-        processor.tokenizer.pad_token_id = processor.tokenizer.unk_token_id
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+    processor.tokenizer.chat_template = chat_template
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -255,7 +278,7 @@ if __name__ == "__main__":
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=make_voxtral_collate_fn(processor),
+        data_collator=make_voxtral_collate_fn(processor, chat_template),
         processing_class=processor,
         peft_config=lora_config
     )
