@@ -19,10 +19,8 @@ import wandb
 from tqdm.auto import tqdm
 import warnings
 
-# TODO: Keep coding, it's not finished. CHeck that functions don't reference globa lvariable that don't exist in this
-#  file. Also wrap global code in function, and train code in main
 
-def create_datasets(df, commands_list, test_size=0.1):
+def create_datasets(df, commands_list, processor, test_size=0.1):
     def format_dataframe_to_dataset(frame, audio_dir="./data/synthesized_train_16k/"):
         dataset_dict = {"messages": []}
         missing_files = 0
@@ -54,7 +52,7 @@ def create_datasets(df, commands_list, test_size=0.1):
     eval_ds = format_dataframe_to_dataset(df_eval)
     return train_ds, eval_ds
 
-def get_prepared_model(quantization_config):
+def get_prepared_model(model_id, quantization_config, device, compute_dtype, processor):
     model = VoxtralForConditionalGeneration.from_pretrained(
         model_id,
         quantization_config=quantization_config,
@@ -78,214 +76,208 @@ def get_prepared_model(quantization_config):
     model.config.bos_token_id = processor.tokenizer.bos_token_id
     return model
 
-def voxtral_collate_fn(batch):
-    conversations = [item["messages"] for item in batch]
-    inputs = processor.apply_chat_template(
-        conversations,
-        tokenize=True,
-        return_dict=True,
-        processor_kwargs={
-            "padding": True, "return_tensors": "pt"}
+def make_voxtral_collate_fn(processor):
+    def voxtral_collate_fn(batch):
+        conversations = [item["messages"] for item in batch]
+        inputs = processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            return_dict=True,
+            processor_kwargs={"padding": True, "return_tensors": "pt"}
+        )
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        # Initialize labels for loss calculation
+        labels = input_ids.clone()
+        # Apply instruction masking logic
+        inst_token_ids = processor.tokenizer.encode("[/INST]", add_special_tokens=False)
+        seq_len = len(inst_token_ids)
+        inst_seq = torch.tensor(inst_token_ids, device=labels.device)
+        for i in range(labels.shape[0]):
+            # Mask User Input and Left Padding via Sequence Matching
+            # .unfold creates a sliding window of size `seq_len` to check for the exact token sequence
+            matches = (labels[i].unfold(0, seq_len, 1) == inst_seq).all(dim=1)
+            inst_indices = matches.nonzero(as_tuple=True)[0]
+            if len(inst_indices) > 0:
+                # Shift the index to the END of the [/INST] sequence
+                first_inst_end_idx = inst_indices[0] + seq_len - 1
+                # Mask everything up to and including the [/INST] sequence
+                labels[i, :first_inst_end_idx + 1] = -100
+            # Mask right-side dummy padding
+            eos_indices = (labels[i] == processor.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_indices) > 0:
+                # The first EOS belongs to our Assistant response
+                target_eos_idx = eos_indices[0]
+                # Safely mask everything after the target EOS token
+                labels[i, target_eos_idx + 1:] = -100
+                # Clean up attention mask and input ids for the dummy turn
+                attention_mask[i, target_eos_idx + 1:] = 0
+                input_ids[i, target_eos_idx + 1:] = processor.tokenizer.pad_token_id
+        inputs["input_ids"] = input_ids
+        inputs["attention_mask"] = attention_mask
+        inputs["labels"] = labels
+        return inputs
+    return voxtral_collate_fn
+
+if __name__ == "__main__":
+    warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
+    os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    os.environ["WANDB_PROJECT"] = "Voxtral-GLaDOS-Multimodal"
+    os.environ["WANDB_LOG_MODEL"] = "false"
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main_process = (local_rank == 0)
+    torch.cuda.set_device(local_rank)
+    if is_main_process:
+        wandb.login()
+
+    model_id = "mistralai/Voxtral-Mini-3B-2507"
+    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if is_main_process:
+        print(f"Loading processor for {model_id}...")
+    processor = AutoProcessor.from_pretrained(model_id)
+    # Right padding for training
+    processor.tokenizer.padding_side = "right"
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.unk_token
+        processor.tokenizer.pad_token_id = processor.tokenizer.unk_token_id
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4", # Highly optimized for speed/accuracy
+        bnb_4bit_use_double_quant=True, # Saves extra memory at no speed cost
+        bnb_4bit_compute_dtype=compute_dtype
     )
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-    # Initialize labels for loss calculation
-    labels = input_ids.clone()
-    # Apply instruction masking logic
-    inst_token_ids = processor.tokenizer.encode("[/INST]", add_special_tokens=False)
-    seq_len = len(inst_token_ids)
-    inst_seq = torch.tensor(inst_token_ids, device=labels.device)
-    for i in range(labels.shape[0]):
-        # Mask User Input and Left Padding via Sequence Matching
-        # .unfold creates a sliding window of size `seq_len` to check for the exact token sequence
-        matches = (labels[i].unfold(0, seq_len, 1) == inst_seq).all(dim=1)
-        inst_indices = matches.nonzero(as_tuple=True)[0]
-        if len(inst_indices) > 0:
-            # Shift the index to the END of the [/INST] sequence
-            first_inst_end_idx = inst_indices[0] + seq_len - 1
-            # Mask everything up to and including the [/INST] sequence
-            labels[i, :first_inst_end_idx + 1] = -100
-        # Mask right-side dummy padding
-        eos_indices = (labels[i] == processor.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
-        if len(eos_indices) > 0:
-            # The first EOS belongs to our Assistant response
-            target_eos_idx = eos_indices[0]
-            # Safely mask everything after the target EOS token
-            labels[i, target_eos_idx + 1:] = -100
-            # Clean up attention mask and input ids for the dummy turn
-            attention_mask[i, target_eos_idx + 1:] = 0
-            input_ids[i, target_eos_idx + 1:] = processor.tokenizer.pad_token_id
-    inputs["input_ids"] = input_ids
-    inputs["attention_mask"] = attention_mask
-    inputs["labels"] = labels
-    return inputs
-
-warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-os.environ["WANDB_PROJECT"] = "Voxtral-GLaDOS-Multimodal"
-os.environ["WANDB_LOG_MODEL"] = "false"
-wandb.login()
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_id = "mistralai/Voxtral-Mini-3B-2507"
-compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
-processor = AutoProcessor.from_pretrained(model_id)
-# Right padding for training
-processor.tokenizer.padding_side = "right"
-if processor.tokenizer.pad_token is None:
-    processor.tokenizer.pad_token = processor.tokenizer.unk_token
-    processor.tokenizer.pad_token_id = processor.tokenizer.unk_token_id
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4", # Highly optimized for speed/accuracy
-    bnb_4bit_use_double_quant=True, # Saves extra memory at no speed cost
-    bnb_4bit_compute_dtype=compute_dtype
-)
-
-df = pd.read_csv("./data/combined_multimodal_dataset_train.csv")
-# Extract all unique user commands
-unique_commands = df['User_Command'].unique().tolist()
-print(f"Total Unique Commands: {len(unique_commands)}")
-
-best_params = {
-    'learning_rate': 2e-4,
-    'lora_r': 16,
-    'lora_alpha': 32,
-    'lora_dropout': 0.1
-    }
-params_path = "./models/best_sweep_params.json"
-if os.path.exists(params_path):
-    print(f"Found existing configuration at {params_path}")
-    with open(params_path, "r") as f:
-        best_params = json.load(f)
-print("Generating complete datasets for final fine-tuning...")
-train_dataset, eval_dataset = create_datasets(df, unique_commands)
-del df, unique_commands
-gc.collect()
-torch.cuda.empty_cache()
-
-# --- 1. Multi-GPU / DDP Setup ---
-# torchrun/accelerate automatically sets LOCAL_RANK for each GPU process
-local_rank = int(os.environ.get("LOCAL_RANK", 0))
-is_main_process = (local_rank == 0)
-
-# Pin the current process to its specific GPU
-torch.cuda.set_device(local_rank)
-
-if is_main_process:
-    print(f"Loading {model_id} in 4-bit precision...")
-
-output_dir = "./models/voxtral-glados-sft"
-run_id_file = os.path.join(output_dir, "wandb_run_id.txt")
-last_checkpoint = None
-wandb_run_id = None
-
-if os.path.exists(output_dir):
-    last_checkpoint = get_last_checkpoint(output_dir)
-    if last_checkpoint and os.path.exists(run_id_file):
-        with open(run_id_file, "r") as f:
-            wandb_run_id = f.read().strip()
-
-# --- 2. Gate W&B Initialization to Main Process ---
-if is_main_process:
-    if last_checkpoint and wandb_run_id:
-        print(f"Resuming W&B run: {wandb_run_id}...")
-        wandb.init(project="Voxtral-GLaDOS-Multimodal", id=wandb_run_id, resume="must")
-    else:
-        print("Starting a new W&B run...")
-        wandb_run_id = wandb.util.generate_id()
-        os.makedirs(output_dir, exist_ok=True)
-        with open(run_id_file, "w") as f:
-            f.write(wandb_run_id)
-        wandb.init(project="Voxtral-GLaDOS-Multimodal", name="voxtral-GLaDOS", id=wandb_run_id, resume="allow")
-
-# --- 3. Strict Device Mapping for QLoRA ---
-# CRITICAL: For DDP + QLoRA, you cannot use device_map="auto".
-# You must map the model specifically to the local GPU process.
-# Ensure your `get_prepared_model` function accepts and applies this device_map:
-model = get_prepared_model(bnb_config, device_map={"": local_rank})
-
-lora_config = LoraConfig(
-    r=best_params['lora_r'],
-    lora_alpha=best_params['lora_alpha'],
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=best_params['lora_dropout'],
-    bias="none",
-    task_type="CAUSAL_LM"
-)
-
-training_args = SFTConfig(
-    output_dir=output_dir,
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=4,
-    eval_strategy="steps",
-    eval_steps=800,
-    save_strategy="steps",
-    save_steps=800,
-    save_total_limit=3,
-    load_best_model_at_end=True,
-    gradient_checkpointing=True,
-    gradient_checkpointing_kwargs={"use_reentrant": False},
-
-    # --- 4. Adjusted Gradient Accumulation ---
-    # 4 GPUs * 1 bs * 4 grad_acc = 16 effective global batch size.
-    # This maintains the exact same math as your single-GPU setup (1 * 1 * 16).
-    gradient_accumulation_steps=4,
-
-    dataloader_num_workers=4,
-    dataloader_pin_memory=True,
-    dataloader_prefetch_factor=2,
-    learning_rate=best_params['learning_rate'],
-    logging_steps=10,
-    num_train_epochs=5,
-    optim="paged_adamw_8bit",
-    bf16=torch.cuda.is_bf16_supported(),
-    fp16=not torch.cuda.is_bf16_supported(),
-    remove_unused_columns=False,
-    dataset_kwargs={"skip_prepare_dataset": True},
-
-    # HF Trainer automatically restricts wandb logging to the main process internally
-    report_to="wandb",
-
-    # --- 5. DDP Requirement ---
-    # Essential for DDP + Gradient Checkpointing to prevent stalling/crashing
-    ddp_find_unused_parameters=False,
-
-    neftune_noise_alpha=5,
-    lr_scheduler_type="cosine",
-    warmup_ratio=0.03,
-    weight_decay=0.01
-)
-
-trainer = SFTTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    data_collator=voxtral_collate_fn,
-    processing_class=processor,
-    peft_config=lora_config
-)
-
-if is_main_process:
-    trainer.model.print_trainable_parameters()
-    print("Initiating QLoRA Multimodal Alignment on 4 GPUs...")
-
-try:
-    if last_checkpoint is not None:
-        if is_main_process: print(f"Resuming training from {last_checkpoint}...")
-        trainer.train(resume_from_checkpoint=last_checkpoint)
-    else:
-        if is_main_process: print("Starting a new training run...")
-        trainer.train()
 
     if is_main_process:
-        trainer.save_model(os.path.join(output_dir, "final_adapters"))
-        print("Training complete. Adapters saved.")
-finally:
-    del model, trainer
+        print("Loading and preparing datasets...")
+    df = pd.read_csv("./data/combined_multimodal_dataset_train.csv")
+    # Extract all unique user commands
+    unique_commands = df['User_Command'].unique().tolist()
+    if is_main_process:
+        print(f"Total Unique Commands: {len(unique_commands)}")
+
+    best_params = {
+        'learning_rate': 2e-4,
+        'lora_r': 16,
+        'lora_alpha': 32,
+        'lora_dropout': 0.1
+        }
+    params_path = "./models/best_sweep_params.json"
+    if os.path.exists(params_path):
+        print(f"Found existing configuration at {params_path}")
+        with open(params_path, "r") as f:
+            best_params = json.load(f)
+    train_dataset, eval_dataset = create_datasets(df, unique_commands)
+    del df, unique_commands
     gc.collect()
     torch.cuda.empty_cache()
-    if is_main_process and wandb.run is not None:
-        wandb.finish()
+
+    if is_main_process:
+        print(f"Loading {model_id} in 4-bit precision...")
+    output_dir = "./models/voxtral-glados-sft"
+    run_id_file = os.path.join(output_dir, "wandb_run_id.txt")
+    last_checkpoint = None
+    wandb_run_id = None
+
+    if os.path.exists(output_dir):
+        last_checkpoint = get_last_checkpoint(output_dir)
+        if last_checkpoint and os.path.exists(run_id_file):
+            with open(run_id_file, "r") as f:
+                wandb_run_id = f.read().strip()
+
+    # Gate W&B Initialization to Main Process
+    if is_main_process:
+        if last_checkpoint and wandb_run_id:
+            print(f"Resuming W&B run: {wandb_run_id}...")
+            wandb.init(project="Voxtral-GLaDOS-Multimodal", id=wandb_run_id, resume="must")
+        else:
+            print("Starting a new W&B run...")
+            wandb_run_id = wandb.util.generate_id()
+            os.makedirs(output_dir, exist_ok=True)
+            with open(run_id_file, "w") as f:
+                f.write(wandb_run_id)
+            wandb.init(project="Voxtral-GLaDOS-Multimodal", name="voxtral-GLaDOS", id=wandb_run_id, resume="allow")
+
+    # 3. Strict Device Mapping for QLoRA
+    model = get_prepared_model(
+        model_id=model_id,
+        quantization_config=bnb_config,
+        device={"": local_rank},
+        compute_dtype=compute_dtype,
+        processor=processor
+    )
+
+    lora_config = LoraConfig(
+        r=best_params['lora_r'],
+        lora_alpha=best_params['lora_alpha'],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=best_params['lora_dropout'],
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+
+    training_args = SFTConfig(
+        output_dir=output_dir,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=4,
+        eval_strategy="steps",
+        eval_steps=800,
+        save_strategy="steps",
+        save_steps=800,
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_accumulation_steps=4,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=2,
+        learning_rate=best_params['learning_rate'],
+        logging_steps=10,
+        num_train_epochs=5,
+        optim="paged_adamw_8bit",
+        bf16=torch.cuda.is_bf16_supported(),
+        fp16=not torch.cuda.is_bf16_supported(),
+        remove_unused_columns=False,
+        dataset_kwargs={"skip_prepare_dataset": True},
+        report_to="wandb",
+        ddp_find_unused_parameters=False, # Essential for DDP + Gradient Checkpointing to prevent stalling/crashing
+        neftune_noise_alpha=5,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        weight_decay=0.01
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=make_voxtral_collate_fn(processor),
+        processing_class=processor,
+        peft_config=lora_config
+    )
+
+    if is_main_process:
+        trainer.model.print_trainable_parameters()
+        print("Initiating QLoRA Multimodal Alignment...")
+    try:
+        if last_checkpoint is not None:
+            if is_main_process:
+                print(f"Resuming training from {last_checkpoint}...")
+            trainer.train(resume_from_checkpoint=last_checkpoint)
+        else:
+            if is_main_process:
+                print("Starting a new training run...")
+            trainer.train()
+
+        if is_main_process:
+            trainer.save_model(os.path.join(output_dir, "final_adapters"))
+            print("Training complete. Adapters saved.")
+    finally:
+        del model, trainer
+        gc.collect()
+        torch.cuda.empty_cache()
+        if is_main_process and wandb.run is not None:
+            wandb.finish()
