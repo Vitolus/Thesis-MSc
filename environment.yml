@@ -33,5 +33,6 @@ dependencies:
   - wandb
   - pip:
       - bitsandbytes
+      - liger-kernel
       - mistral-common[audio,hf-hub]
       - https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.17/flash_attn-2.8.3+cu132torch2.12-cp312-cp312-linux_x86_64.whl
