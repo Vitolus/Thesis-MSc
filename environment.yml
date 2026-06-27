@@ -5,9 +5,10 @@ channels:
 dependencies:
   - python=3.12
   - pip
-  - numpy>=2.2.4
+  - numpy
   - matplotlib
-  - transformers>=5.5.0
+  - huggingface_hub
+  - transformers>=5.12.0
   - accelerate
   - optimum
   - evaluate
@@ -19,13 +20,18 @@ dependencies:
   - tqdm
   - optuna
   - pandas
-  - pandas-stubs
   - seaborn
   - pysoundfile
   - librosa
   - num2words
-  - nvidia::cuda-toolkit>=13.0
-  - setuptools<82.0
+  - setuptools
   - peft
   - trl>=1.7.0
+  - pytorch=2.12
+  - torchaudio
+  - torchvision
   - wandb
+  - pip:
+      - bitsandbytes
+      - mistral-common[audio,hf-hub]
+      - https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.17/flash_attn-2.8.3+cu132torch2.12-cp312-cp312-linux_x86_64.whl
