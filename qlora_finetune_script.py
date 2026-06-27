@@ -56,7 +56,7 @@ def get_prepared_model(model_id, quantization_config, device, compute_dtype, pro
     model = VoxtralForConditionalGeneration.from_pretrained(
         model_id,
         quantization_config=quantization_config,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
         device_map=device
     )
     # Prepare model for gradient training
@@ -140,30 +140,15 @@ if __name__ == "__main__":
 
     model_id = "mistralai/Voxtral-Mini-3B-2507"
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    chat_template = (
-        "{% for message in messages %}"
-        "{% if message['role'] == 'user' %}[INST] "
-        "{% if message['content'] is string %}{{ message['content'] }}"
-        "{% else %}{% for block in message['content'] %}"
-        "{% if block['type'] == 'text' %}{{ block['text'] }}"
-        "{% elif block['type'] == 'audio' %}<audio>"
-        "{% endif %}{% endfor %}{% endif %} [/INST]"
-        "{% elif message['role'] == 'assistant' %}"
-        "{% if message['content'] is string %}{{ message['content'] }}"
-        "{% else %}{% for block in message['content'] %}"
-        "{% if block['type'] == 'text' %}{{ block['text'] }}"
-        "{% endif %}{% endfor %}{% endif %}"
-        "{% endif %}{% endfor %}"
-    )
     if is_main_process:
         print(f"Loading processor for {model_id}...")
     processor = AutoProcessor.from_pretrained(model_id)
     # Right padding for training
     processor.tokenizer.padding_side = "right"
     if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
-    processor.tokenizer.chat_template = chat_template
+        processor.tokenizer.pad_token = processor.tokenizer.pad_token
+        processor.tokenizer.pad_token_id = processor.tokenizer.pad_token_id
+    chat_template = processor.tokenizer.chat_template
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -265,6 +250,8 @@ if __name__ == "__main__":
         fp16=not torch.cuda.is_bf16_supported(),
         remove_unused_columns=False,
         dataset_kwargs={"skip_prepare_dataset": True},
+        loss_type="nll",
+        use_liger_kernel=True,
         report_to="wandb",
         ddp_find_unused_parameters=False, # Essential for DDP + Gradient Checkpointing to prevent stalling/crashing
         neftune_noise_alpha=5,

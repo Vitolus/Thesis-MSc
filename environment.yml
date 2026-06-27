@@ -27,5 +27,5 @@ dependencies:
   - nvidia::cuda-toolkit>=13.0
   - setuptools<82.0
   - peft
-  - trl>=1.5.1
+  - trl>=1.7.0
   - wandb
