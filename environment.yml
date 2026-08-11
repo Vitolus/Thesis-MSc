@@ -8,7 +8,7 @@ dependencies:
   - numpy
   - matplotlib
   - huggingface_hub
-  - transformers>=5.12.0
+  - transformers[version='>=5.12']
   - accelerate
   - optimum
   - evaluate
@@ -26,12 +26,16 @@ dependencies:
   - num2words
   - setuptools
   - peft
-  - trl>=1.7.0
-  - pytorch=2.12
+  - trl[version='>=1.7.0']
+  - pytorch[version='>=2.12']
   - torchaudio
   - torchvision
   - wandb
+  - nltk
+  -
   - pip:
+      - rouge-score
+      - bert-score
       - bitsandbytes
       - liger-kernel
       - mistral-common[audio,hf-hub]
