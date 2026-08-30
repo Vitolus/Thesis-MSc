@@ -32,7 +32,7 @@ dependencies:
   - torchvision
   - wandb
   - nltk
-  -
+  - speechrecognition
   - pip:
       - rouge-score
       - bert-score
