@@ -33,6 +33,8 @@ dependencies:
   - wandb
   - nltk
   - speechrecognition
+  - pysoundfile
+  - python-sounddevice
   - pip:
       - rouge-score
       - bert-score
