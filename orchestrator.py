@@ -3,14 +3,14 @@ import os
 import re
 import json
 import time
-import tempfile
+import io
+import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
 import requests
 import speech_recognition as sr
 import sounddevice as sd
 import torch
-from transformers import AutoProcessor, VoxtralForConditionalGeneration, BitsAndBytesConfig
+from transformers import AutoProcessor, VoxtralForConditionalGeneration, BitsAndBytesConfig, TextIteratorStreamer
 from peft import PeftModel, PeftConfig
 # Dynamically add the cloned folder to Python's search path
 repo_path = os.path.abspath("../GLaDOS-TTS")
@@ -19,18 +19,11 @@ if repo_path not in sys.path:
 try:
     import glados
 except ImportError:
-    raise ImportError(
-        "Could not find the 'glados' module. Make sure you cloned the repository "
-        "into the same directory as this script."
-    )
+    raise ImportError("Ensure nimaid/GLaDOS-TTS is installed and in your PYTHONPATH.")
 
-# CONFIGURATION AND FLAGS
-# Set to False if lacking acoustic echo canceling hardware
-ENABLE_FULL_DUPLEX = False
-# Model and Adapter Paths
+# CONFIGURATION
 MODEL_ID = "mistralai/Voxtral-Mini-3B-2507"
 LORA_PATH = "./models/voxtral-glados-sft/final_adapters"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 # Home Assistant REST Configuration
 HA_URL = "http://homeassistant.local:8123/api/services"
@@ -47,20 +40,15 @@ SYSTEM_INSTRUCTION = (
 )
 # Global Engine Handles
 GLADOS_ENGINE = None
+AUDIO_QUEUE = queue.Queue()
 IS_SPEAKING = threading.Event()
 
-# SUBSYSTEM INITIALIZATION
-def initialize_glados_tts():
-    """Initializes and prewarms the GLaDOS-TTS engine."""
+# INITIALIZATION
+def initialize_subsystems():
     global GLADOS_ENGINE
-    print("[TTS] Initializing GLaDOS-TTS engine...")
+    print("[INIT] Loading GLaDOS-TTS engine...")
     GLADOS_ENGINE = glados.TTS()
-    print("[TTS] GLaDOS-TTS operational.")
-
-# Model Initialization
-def initialize_model():
-    """Loads 4-bit quantized Voxtral and injects finetuned GLaDOS LoRA adapters."""
-    print(f"[Model] Loading Base Voxtral Processor and Model ({MODEL_ID})...")
+    print(f"[INIT] Loading 4-bit Voxtral ({MODEL_ID})...")
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -78,7 +66,7 @@ def initialize_model():
     )
     peft_config = PeftConfig.from_pretrained(LORA_PATH)
     peft_config.init_lora_weights = False
-    print(f"[Model] Injecting LoRA adapter weights from '{LORA_PATH}'...")
+    print(f"[INIT] Attaching LoRA adapter from {LORA_PATH}...")
     model = PeftModel.from_pretrained(
         base_model,
         LORA_PATH,
@@ -86,225 +74,190 @@ def initialize_model():
         is_trainable=False
     )
     model.eval()
-    print("[Model] Multimodal SLU pipeline active.")
+    print("[INIT] Multimodal SLU pipeline active.")
     return processor, model
 
-# MODULAR AUDIO INPUT MANAGER
-class AudioInputManager:
+# ASYNCHRONOUS HOME ASSISTANT
+def dispatch_ha_async(payload_text):
     """
-    Encapsulates audio acquisition.
-    Supports standard half duplex turn taking and optional full duplex with barge in interruption.
+    Parses and fires the Home Assistant REST request in a dedicated daemon thread.
+    Does not block the token streaming or speech pipeline.
     """
+    def _execute():
+        matches = re.finditer(r'(\{.*?\})', payload_text, re.DOTALL)
+        for match in matches:
+            try:
+                payload = json.loads(match.group(1))
+                if not payload:
+                    continue
+                service_call = payload.get("service")
+                target_device = payload.get("target_device")
+                if not service_call or "." not in service_call:
+                    continue
+                domain, service = service_call.split(".", 1)
+                endpoint = f"{HA_URL}/{domain}/{service}"
+                body = {}
+                if target_device:
+                    body["entity_id"] = target_device
+                for key, val in payload.items():
+                    if key not in ["service", "target_device"]:
+                        body[key] = val
+                t0 = time.perf_counter()
+                resp = requests.post(endpoint, headers=HA_HEADERS, json=body, timeout=2.0)
+                latency = (time.perf_counter() - t0) * 1000
+                if resp.ok:
+                    print(f"\n[HA OK] >> {service_call} ({latency:.1f} ms)")
+                else:
+                    print(f"\n[HA ERROR] >> Request failed: {resp.status_code}")
+            except Exception as err:
+                print(f"\n[HA ERROR] >> Execution failed: {err}")
+    thread = threading.Thread(target=_execute, daemon=True)
+    thread.start()
 
-    def __init__(self, full_duplex_enabled=False):
-        self.full_duplex_enabled = full_duplex_enabled
-        self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = 300
-        self.recognizer.dynamic_energy_threshold = True
-        self.microphone = sr.Microphone(sample_rate=16000)
-
-    def capture_command(self):
-        """
-        Captures speech from the microphone.
-        If half-duplex: ensures no output playback is currently active before listening.
-        If full-duplex: monitors for barge-in and stops audio playback if user speaks.
-        """
-        global GLADOS_ENGINE
-
-        # In half duplex mode, wait until any ongoing TTS playback completely finishes
-        if not self.full_duplex_enabled:
-            while IS_SPEAKING.is_set():
-                time.sleep(0.05)
-        with self.microphone as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=0.4)
-            print("\n[Listening] Awaiting user command...")
-
-            audio = self.recognizer.listen(source, phrase_time_limit=10)
-
-            # Active only when full duplex flag is enabled
-            if self.full_duplex_enabled and IS_SPEAKING.is_set():
-                print("\n[Barge in] User speech detected during speech output. Halting TTS...")
-                if GLADOS_ENGINE:
-                    GLADOS_ENGINE.stop_audio()
+# PIPELINED SPEECH WORKER THREAD
+def tts_playback_worker():
+    """
+    Continuously consumes text and prosody events from the queue and plays audio.
+    Runs concurrently with token generation.
+    """
+    current_speed = "normal"
+    base_sample_rate = 22050
+    while True:
+        item = AUDIO_QUEUE.get()
+        if item is None:
+            break
+        tag_type, content = item
+        IS_SPEAKING.set()
+        try:
+            if tag_type == "PAUSE":
+                time.sleep(0.35)
+            elif tag_type == "SPEED":
+                current_speed = content
+            elif tag_type == "TEXT":
+                if content.strip():
+                    audio = GLADOS_ENGINE.generate_speech_audio(content)
+                    if audio is not None and len(audio) > 0:
+                        # Adjust inter-word pauses based on tag state
+                        sd.play(audio, samplerate=int(base_sample_rate * current_speed))
+                        sd.wait()
+        finally:
+            if AUDIO_QUEUE.empty():
                 IS_SPEAKING.clear()
+            AUDIO_QUEUE.task_done()
 
-        # Save buffer to 16kHz mono WAV for Voxtral processing
-        temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        temp_wav.write(audio.get_wav_data(convert_rate=16000, convert_width=2))
-        temp_wav.close()
-        return temp_wav.name
-
-# PARSING AND EXECUTION LOGIC
-def parse_output(raw_text):
+# STREAMING TOKEN PARSER
+def stream_and_process(streamer):
     """
-    Splits Voxtral output into Home Assistant JSON payload and GLaDOS character speech.
+    Consumes tokens in realtime. Delivers the JSON section to HA the moment
+    it terminates, and streams complete phrases directly to the TTS worker.
     """
-    parts = raw_text.split('\n\n', 1)
-    json_section = parts
-    verbal_response = parts if len(parts) > 1 else "No text generated"
-    payloads = []
-    matches = re.finditer(r'(\{.*?\})', json_section, re.DOTALL)
-    for match in matches:
-        try:
-            parsed = json.loads(match.group(1))
-            if parsed:  # Omit empty dictionary queries
-                payloads.append(parsed)
-        except json.JSONDecodeError:
-            pass
-    return payloads, verbal_response.strip()
-
-def execute_ha_payloads(payloads):
-    """Dispatches domotic service calls directly to Home Assistant REST API."""
-    if not payloads:
-        print("[Domotics] Informational query or empty payload. No device actions required.")
-        return
-
-    for payload in payloads:
-        service_call = payload.get("service")
-        target_device = payload.get("target_device")
-        if not service_call or "." not in service_call:
-            print(f"[Domotics Error] Invalid service format: '{service_call}'")
-            continue
-        domain, service = service_call.split(".", 1)
-        endpoint = f"{HA_URL}/{domain}/{service}"
-        body = {}
-        if target_device:
-            body["entity_id"] = target_device
-        for key, val in payload.items():
-            if key not in ["service", "target_device"]:
-                body[key] = val
-        try:
-            response = requests.post(endpoint, headers=HA_HEADERS, json=body, timeout=3.0)
-            if response.ok:
-                print(f"[Domotics Success] >> Executed '{service_call}' on '{target_device}'")
-            else:
-                print(f"[Domotics Failed] >> Status {response.status_code}: {response.text}")
-        except Exception as err:
-            print(f"[Domotics Exception] >> Network error communicating with Home Assistant: {err}")
-
-def speak_segment(tts_engine, text, speed=1.0):
-    """
-    Synthesizes and plays back speech for a segment at the specified speed.
-    """
-    if not text.strip():
-        return
-
-    # If pacing is standard, use standard engine playback
-    if abs(speed - 1.0) < 1e-3:
-        tts_engine.speak_text_aloud(text)
-    else:
-        # Generate raw audio array from nimaid GLaDOS-TTS
-        # Output is typically a float32/int16 NumPy array at 22050 Hz
-        audio = tts_engine.generate_speech_audio(text)
-        if audio is not None and len(audio) > 0:
-            # Base sample rate of the GLaDOS Tacotron/VITS vocoder
-            base_sample_rate = getattr(tts_engine, "sample_rate", 22050)
-            # Modulate playback sample rate to alter speed without buffer truncation
-            adjusted_rate = int(base_sample_rate * speed)
-            sd.play(audio, samplerate=adjusted_rate)
-            sd.wait()
-
-def speak_glados(text):
-    """
-    Parses temporal tags (<fast>, <slow_deadpan>, <pause>, <sigh>) and routes
-    clean speech segments to nimaid GLaDOS-TTS with appropriate timing delays.
-    """
-    global GLADOS_ENGINE
-    if not text or not GLADOS_ENGINE:
-        return
-
-    print(f"\n[GLaDOS Verbal Output]: {text}")
-    IS_SPEAKING.set()
+    accumulated_text = ""
+    payload_dispatched = False
+    active_phrase = ""
     current_speed = 1.0
-    tokens = re.split(r'(<[^>]+>)', text)
-    try:
-        for token in tokens:
-            token = token.strip()
-            if not token:
-                continue
-            # Interruption check
-            if not IS_SPEAKING.is_set():
-                break
-            # Syntactic pause delays
-            if token == "<pause>":
-                time.sleep(0.25)
-            elif token == "<sigh>":
-                speak_segment(GLADOS_ENGINE, "sigh", speed=current_speed)
-            elif token == "<fast>":
-                current_speed = 1.25
-            elif token == "<slow_deadpan>":
-                current_speed = 0.80
-            else:
-                clean_segment = re.sub(r'<[^>]+>', '', token).strip()
-                if clean_segment:
-                    speak_segment(GLADOS_ENGINE, clean_segment, speed=current_speed)
-    finally:
-        IS_SPEAKING.clear()
-
-def dispatch_actions_in_parallel(payloads, verbal_response):
-    """
-    Dispatches Home Assistant service execution and GLaDOS speech synthesis
-    concurrently using worker threads.
-    """
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_ha = executor.submit(execute_ha_payloads, payloads)
-        future_tts = executor.submit(speak_glados, verbal_response)
-        # Wait for both asynchronous tasks to finalize before starting the next user turn
-        future_ha.result()
-        future_tts.result()
+    for token in streamer:
+        accumulated_text += token
+        # Detect completion of the JSON payload section
+        if not payload_dispatched and "\n\n" in accumulated_text:
+            json_part, verbal_start = accumulated_text.split("\n\n", 1)
+            dispatch_ha_async(json_part)
+            payload_dispatched = True
+            accumulated_text = verbal_start
+            active_phrase = verbal_start
+            continue
+        if not payload_dispatched:
+            continue
+        active_phrase += token
+        # Handle inline prosody tags as they emerge
+        tag_match = re.search(r'(<[^>]+>)', active_phrase)
+        if tag_match:
+            tag = tag_match.group(1)
+            before_tag = active_phrase[:tag_match.start()].strip()
+            if before_tag:
+                AUDIO_QUEUE.put(("TEXT", before_tag))
+            if tag == "<pause>":
+                AUDIO_QUEUE.put(("PAUSE", 0.30))
+            elif tag == "<sigh>":
+                AUDIO_QUEUE.put(("TEXT", "sigh"))
+            elif tag == "<fast>":
+                current_speed = 1.20
+                AUDIO_QUEUE.put(("SPEED", current_speed))
+            elif tag == "<slow_deadpan>":
+                current_speed = 0.85
+                AUDIO_QUEUE.put(("SPEED", current_speed))
+            active_phrase = active_phrase[tag_match.end():]
+            continue
+        # Stream by natural phrase boundaries for lowest Time-To-First Audio
+        if any(punct in token for punct in [".", "!", "?", ","]):
+            clean_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
+            if clean_chunk:
+                AUDIO_QUEUE.put(("TEXT", clean_chunk))
+            active_phrase = ""
+    # Flush any remaining tokens
+    final_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
+    if final_chunk:
+        AUDIO_QUEUE.put(("TEXT", final_chunk))
 
 if __name__ == "__main__":
-    initialize_glados_tts()
-    processor, model = initialize_model()
-    # Initialize the modular audio manager with our full-duplex flag
-    audio_manager = AudioInputManager(full_duplex_enabled=ENABLE_FULL_DUPLEX)
-    mode_label = "Full Duplex" if ENABLE_FULL_DUPLEX else "Half Duplex"
-    print("\n" + "=" * 60)
-    print(f" GLaDOS HOME ASSISTANT ORCHESTRATOR")
-    print(f" Operating Mode: {mode_label}")
-    print("=" * 60)
+    processor, model = initialize_subsystems()
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+    microphone = sr.Microphone(sample_rate=16000)
+    # Start persistent TTS background thread
+    tts_thread = threading.Thread(target=tts_playback_worker, daemon=True)
+    tts_thread.start()
+    print("\n[Active] High-efficiency streaming orchestrator ready.")
     try:
         while True:
-            # Capture speech (synchronous in half duplex, interrupt aware in full duplex)
-            audio_path = audio_manager.capture_command()
-            # Structure multimodal chat context
+            # Wait for any lingering playback before opening microphone
+            while IS_SPEAKING.is_set():
+                time.sleep(0.02)
+            with microphone as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                print("\n[Listening] Speak your command...")
+                audio = recognizer.listen(source, phrase_time_limit=8)
+            t_start = time.perf_counter()
+            # In memory WAV representation
+            wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+            audio_buffer = io.BytesIO(wav_bytes)
             conversations = [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": SYSTEM_INSTRUCTION},
-                        {"type": "audio", "path": audio_path}
+                        {"type": "audio", "path": audio_buffer}
                     ]
                 }
             ]
-            try:
-                inputs = processor.apply_chat_template(
-                    conversations,
-                    add_generation_prompt=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                    processor_kwargs={"padding": False}
-                ).to(model.device, dtype=COMPUTE_DTYPE)
-                # Model Inference
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=256,
-                        do_sample=True,
-                        temperature=0.25,
-                        top_p=0.95,
-                        repetition_penalty=1.05
-                    )
-                input_len = inputs.input_ids.shape
-                generated_text = processor.decode(outputs[0, input_len:], skip_special_tokens=True)
-                # Extract structured payloads and dialogue string
-                payloads, verbal_response = parse_output(generated_text)
-                # Parallel Execution: Dispatches HA network API calls and GLaDOS audio playback simultaneously
-                dispatch_actions_in_parallel(payloads, verbal_response)
-            except Exception as e:
-                print(f"[Processing Error]: {e}")
-            finally:
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
+            inputs = processor.apply_chat_template(
+                conversations,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                processor_kwargs={"padding": False}
+            ).to(model.device, dtype=COMPUTE_DTYPE)
+            # Set up non-blocking token streaming
+            streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            generate_kwargs = dict(
+                **inputs,
+                streamer=streamer,
+                max_new_tokens=256,
+                do_sample=True,
+                temperature=0.25,
+                top_p=0.95,
+                repetition_penalty=1.05,
+                use_cache=True
+            )
+            # Run autoregressive generation in background thread while processing streamer on main thread
+            gen_thread = threading.Thread(target=lambda: model.generate(**generate_kwargs))
+            gen_thread.start()
+            print(f"[Profiling] Preprocessing & prompt encoding took: {(time.perf_counter() - t_start) * 1000:.1f} ms")
+            # Stream tokens: triggers HA early and pipelines TTS
+            stream_and_process(streamer)
+            gen_thread.join()
+            # Ensure all queued audio chunks finish playing
+            AUDIO_QUEUE.join()
     except KeyboardInterrupt:
-        print("\n[Shutdown] Terminating orchestrator runtime cleanly.")
+        print("\n[Shutdown] Orchestrator halted.")
+        AUDIO_QUEUE.put(None)
