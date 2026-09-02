@@ -1,5 +1,6 @@
 import sys
 import os
+import tempfile
 import re
 import json
 import time
@@ -9,6 +10,7 @@ import threading
 import requests
 import speech_recognition as sr
 import sounddevice as sd
+import librosa
 import torch
 from transformers import AutoProcessor, VoxtralForConditionalGeneration, BitsAndBytesConfig, TextIteratorStreamer
 from peft import PeftModel, PeftConfig
@@ -120,8 +122,7 @@ def tts_playback_worker():
     Continuously consumes text and prosody events from the queue and plays audio.
     Runs concurrently with token generation.
     """
-    current_speed = "normal"
-    base_sample_rate = 22050
+    current_speed = 1.0
     while True:
         item = AUDIO_QUEUE.get()
         if item is None:
@@ -132,13 +133,16 @@ def tts_playback_worker():
             if tag_type == "PAUSE":
                 time.sleep(0.35)
             elif tag_type == "SPEED":
-                current_speed = content
+                current_speed = float(content)
             elif tag_type == "TEXT":
                 if content.strip():
                     audio = GLADOS_ENGINE.generate_speech_audio(content)
                     if audio is not None and len(audio) > 0:
-                        # Adjust inter-word pauses based on tag state
-                        sd.play(audio, samplerate=int(base_sample_rate * current_speed))
+                        # If the speed tag is active, mathematically stretch the audio.
+                        if current_speed != 1.0:
+                            # librosa requires a 1D floating-point array
+                            audio = librosa.effects.time_stretch(y=audio, rate=current_speed)
+                        sd.play(audio, samplerate=22050)
                         sd.wait()
         finally:
             if AUDIO_QUEUE.empty():
@@ -220,16 +224,19 @@ if __name__ == "__main__":
             t_start = time.perf_counter()
             # In memory WAV representation
             wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            audio_buffer = io.BytesIO(wav_bytes)
+            temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            temp_wav.write(wav_bytes)
+            temp_wav.close()
             conversations = [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": SYSTEM_INSTRUCTION},
-                        {"type": "audio", "path": audio_buffer}
+                        {"type": "audio", "path": temp_wav.name}
                     ]
                 }
             ]
+            os.remove(temp_wav.name)
             inputs = processor.apply_chat_template(
                 conversations,
                 add_generation_prompt=True,
