@@ -2,6 +2,7 @@ import sys
 import os
 import tempfile
 from contextlib import contextmanager
+import subprocess
 import re
 import json
 import time
@@ -11,6 +12,7 @@ import requests
 import speech_recognition as sr
 import sounddevice as sd
 import librosa
+import numpy as np
 import torch
 from transformers import AutoProcessor, VoxtralForConditionalGeneration, BitsAndBytesConfig, TextIteratorStreamer
 from peft import PeftModel, PeftConfig
@@ -76,32 +78,74 @@ GLADOS_ENGINE = None
 AUDIO_QUEUE = queue.Queue()
 IS_SPEAKING = threading.Event()
 
-
+# HELPER FUNCTIONS
 @contextmanager
-def managed_temp_audio(wav_bytes: bytes):
+def managed_temp_audio_file(filepath: str):
     """
-    A context manager that guarantees the creation, safe closing,
-    and absolute deletion of a temporary audio file on disk,
-    even in the event of an unhandled runtime exception.
+    A context manager that ensures a physical audio file is cleanly deleted
+    from disk after the block exits, even if exceptions are thrown during processing.
     """
-    # Acquisition phase
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     try:
-        temp_file.write(wav_bytes)
-        # Close the write handle so other library processes can safely open it
-        temp_file.close()
-
-        # Hand over the absolute path to the 'with' scope
-        yield temp_file.name
-
+        yield filepath
     finally:
-        # Release/Cleanup phase
         try:
-            if os.path.exists(temp_file.name):
-                os.remove(temp_file.name)
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                # print(f"[Cleanup] Deleted transient file: {filepath}")
         except OSError as err:
-            # Handle OS level lock failures or file access violations gracefully
-            print(f"[Cleanup Warning] Failed to remove transient file: {err}")
+            print(f"[Cleanup Warning] Failed to delete transient file: {err}")
+
+def play_audio_native(audio_array, sample_rate=22050):
+    """
+    Plays a NumPy float32 audio array by converting it to 16-bit PCM
+    and writing it directly to the system's paplay stdin.
+    """
+    # GLaDOS-TTS output is typically float32; scale and clip to 16-bit PCM range
+    if audio_array.dtype != np.int16:
+        audio_array = np.clip(audio_array, -1.0, 1.0)
+        pcm_data = (audio_array * 32767).astype(np.int16).tobytes()
+    else:
+        pcm_data = audio_array.tobytes()
+    # Direct UNIX socket pipe to PulseAudio client via paplay
+    cmd = [
+        "paplay",
+        "--raw",
+        "--channels=1",
+        f"--rate={sample_rate}",
+        "--format=s16le",
+        "--client-name=GLaDOS_Orchestrator"
+    ]
+    try:
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        process.communicate(input=pcm_data)
+    except Exception as err:
+        print(f"[Playback Error] Native PulseAudio pipeline failed: {err}")
+
+def record_audio_native(output_path="/tmp/user_input.wav", duration=5):
+    """
+    Captures input from the default PulseAudio source (mapped to VoiceMeeter B1)
+    and saves it directly as a 16kHz Mono WAV file using parecord.
+    """
+    print(f"\n[Listening] Speak now (Recording for {duration} seconds)...")
+    cmd = [
+        "parecord",
+        "--channels=1",
+        "--rate=16000",
+        "--format=s16le",
+        "--file-format=wav",
+        output_path
+    ]
+    # Spawn the native PulseAudio recording utility as a background task
+    process = subprocess.Popen(cmd)
+    try:
+        # Record for the designated duration
+        time.sleep(duration)
+    finally:
+        # Force terminate the recording process and let the file write complete
+        process.terminate()
+        process.wait()
+    print("[Listening] Recording completed successfully.")
+    return output_path
 
 # INITIALIZATION
 def initialize_subsystems():
@@ -200,8 +244,7 @@ def tts_playback_worker():
                         if current_speed != 1.0:
                             # librosa requires a 1D floating-point array
                             audio = librosa.effects.time_stretch(y=audio, rate=current_speed)
-                        sd.play(audio, samplerate=22050)
-                        sd.wait()
+                        play_audio_native(audio, sample_rate=22050)
         finally:
             if AUDIO_QUEUE.empty():
                 IS_SPEAKING.clear()
@@ -260,12 +303,13 @@ def stream_and_process(streamer):
     if final_chunk:
         AUDIO_QUEUE.put(("TEXT", final_chunk))
 
-if __name__ == "__main__":
+def main():
     processor, model = initialize_subsystems()
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300
-    recognizer.dynamic_energy_threshold = True
-    microphone = sr.Microphone(sample_rate=16000)
+    # recognizer = sr.Recognizer()
+    # recognizer.energy_threshold = 300
+    # recognizer.dynamic_energy_threshold = True
+    # microphone = sr.Microphone(sample_rate=16000)
+
     # Start persistent TTS background thread
     tts_thread = threading.Thread(target=tts_playback_worker, daemon=True)
     tts_thread.start()
@@ -275,14 +319,18 @@ if __name__ == "__main__":
             # Wait for any lingering playback before opening microphone
             while IS_SPEAKING.is_set():
                 time.sleep(0.02)
-            with microphone as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.3)
-                print("\n[Listening] Speak your command...")
-                audio = recognizer.listen(source, phrase_time_limit=8)
+            # with microphone as source:
+            #     recognizer.adjust_for_ambient_noise(source, duration=0.3)
+            #     print("\n[Listening] Speak your command...")
+            #     audio = recognizer.listen(source, phrase_time_limit=8)
+            raw_audio_path = "/tmp/user_input.wav"
+            record_audio_native(raw_audio_path, duration=5)
+
             t_start = time.perf_counter()
             # In memory WAV representation
-            wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            with managed_temp_audio(wav_bytes) as temp_wav_path:
+            # wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+            # with managed_temp_audio(wav_bytes) as temp_wav_path:
+            with managed_temp_audio_file(raw_audio_path) as temp_wav_path:
                 conversations = [
                     {
                         "role": "user",
@@ -323,3 +371,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[Shutdown] Orchestrator halted.")
         AUDIO_QUEUE.put(None)
+
+if __name__ == "__main__":
+    main()
