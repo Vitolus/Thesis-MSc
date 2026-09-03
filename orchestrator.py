@@ -1,10 +1,10 @@
 import sys
 import os
 import tempfile
+from contextlib import contextmanager
 import re
 import json
 import time
-import io
 import queue
 import threading
 import requests
@@ -44,6 +44,33 @@ SYSTEM_INSTRUCTION = (
 GLADOS_ENGINE = None
 AUDIO_QUEUE = queue.Queue()
 IS_SPEAKING = threading.Event()
+
+
+@contextmanager
+def managed_temp_audio(wav_bytes: bytes):
+    """
+    A context manager that guarantees the creation, safe closing,
+    and absolute deletion of a temporary audio file on disk,
+    even in the event of an unhandled runtime exception.
+    """
+    # Acquisition phase
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    try:
+        temp_file.write(wav_bytes)
+        # Close the write handle so other library processes can safely open it
+        temp_file.close()
+
+        # Hand over the absolute path to the 'with' scope
+        yield temp_file.name
+
+    finally:
+        # Release/Cleanup phase
+        try:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+        except OSError as err:
+            # Handle OS level lock failures or file access violations gracefully
+            print(f"[Cleanup Warning] Failed to remove transient file: {err}")
 
 # INITIALIZATION
 def initialize_subsystems():
@@ -224,26 +251,23 @@ if __name__ == "__main__":
             t_start = time.perf_counter()
             # In memory WAV representation
             wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-            temp_wav.write(wav_bytes)
-            temp_wav.close()
-            conversations = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": SYSTEM_INSTRUCTION},
-                        {"type": "audio", "path": temp_wav.name}
-                    ]
-                }
-            ]
-            os.remove(temp_wav.name)
-            inputs = processor.apply_chat_template(
-                conversations,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                processor_kwargs={"padding": False}
-            ).to(model.device, dtype=COMPUTE_DTYPE)
+            with managed_temp_audio(wav_bytes) as temp_wav_path:
+                conversations = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": SYSTEM_INSTRUCTION},
+                            {"type": "audio", "path": temp_wav_path}
+                        ]
+                    }
+                ]
+                inputs = processor.apply_chat_template(
+                    conversations,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    processor_kwargs={"padding": False}
+                ).to(model.device, dtype=COMPUTE_DTYPE)
             # Set up non-blocking token streaming
             streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
             generate_kwargs = dict(
