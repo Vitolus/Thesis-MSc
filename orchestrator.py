@@ -1,5 +1,6 @@
 import sys
 import os
+import warnings
 import tempfile
 from contextlib import contextmanager
 import subprocess
@@ -9,8 +10,7 @@ import time
 import queue
 import threading
 import requests
-import speech_recognition as sr
-import sounddevice as sd
+import scipy.io.wavfile as wav
 import librosa
 import numpy as np
 import torch
@@ -25,6 +25,10 @@ try:
 except ImportError:
     raise ImportError("Ensure nimaid/GLaDOS-TTS is installed and in your PYTHONPATH.")
 
+warnings.filterwarnings("ignore", category=FutureWarning, module="bitsandbytes")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # CONFIGURATION
 MODEL_ID = "mistralai/Voxtral-Mini-3B-2507"
 LORA_PATH = "./models/voxtral-glados-sft/final_adapters"
@@ -146,6 +150,56 @@ def record_audio_native(output_path="/tmp/user_input.wav", duration=5):
         process.wait()
     print("[Listening] Recording completed successfully.")
     return output_path
+
+def calibrate_noise_floor(duration=3.0):
+    """
+    Records a brief segment of ambient silence at startup
+    to dynamically calculate your room's noise floor.
+    """
+    print("[Calibration] Measuring background noise floor... Please remain silent.")
+    temp_path = "/tmp/calibration.wav"
+    # Record ambient background using our native PulseAudio utility
+    record_audio_native(temp_path, duration=duration)
+    try:
+        sample_rate, data = wav.read(temp_path)
+        # Normalize 16-bit integers to float range [-1.0, 1.0] for math consistency
+        if data.dtype == np.int16:
+            normalized = data / 32768.0
+        else:
+            normalized = data
+        # Calculate Root Mean Square energy
+        rms_noise = np.sqrt(np.mean(normalized ** 2))
+        # Set silence threshold to 2.5x the noise floor to establish a safe signal-to-noise ratio
+        calibrated_threshold = max(rms_noise * 2.5, 0.008)
+        print(f"[Calibration] Ambient noise RMS: {rms_noise:.5f}")
+        print(f"[Calibration] Dynamic silence threshold set to: {calibrated_threshold:.5f}")
+        return calibrated_threshold
+    except Exception as err:
+        print(f"[Calibration Warning] Calibration failed ({err}). Using default threshold 0.012.")
+        return 0.012
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+def is_audio_silent(filepath, threshold):
+    """
+    Checks if the RMS energy of the recorded WAV file is below our threshold.
+    Returns True if the file contains only ambient silence or hiss.
+    """
+    try:
+        sample_rate, data = wav.read(filepath)
+        if len(data) == 0:
+            return True
+        if data.dtype == np.int16:
+            normalized = data / 32768.0
+        else:
+            normalized = data
+        rms = np.sqrt(np.mean(normalized ** 2))
+        print(f"[VAD Diagnostic] Captured Segment RMS: {rms:.5f} | Threshold: {threshold:.5f}")
+        return rms < threshold
+    except Exception as err:
+        print(f"[VAD Error] Failed to read audio file for verification: {err}")
+        return True
 
 # INITIALIZATION
 def initialize_subsystems():
@@ -313,6 +367,8 @@ def main():
     # Start persistent TTS background thread
     tts_thread = threading.Thread(target=tts_playback_worker, daemon=True)
     tts_thread.start()
+    # Run ambient sound calibration prior the activation of the pipeline
+    SILENCE_THRESHOLD = calibrate_noise_floor(duration=1.5)
     print("\n[Active] High-efficiency streaming orchestrator ready.")
     try:
         while True:
@@ -326,6 +382,12 @@ def main():
             raw_audio_path = "/tmp/user_input.wav"
             record_audio_native(raw_audio_path, duration=5)
 
+            # Intercept empty or purely noisy recordings before they hit the GPU
+            if is_audio_silent(raw_audio_path, SILENCE_THRESHOLD):
+                print("[VAD] Silence or ambient room noise detected. Skipping inference.")
+                if os.path.exists(raw_audio_path):
+                    os.remove(raw_audio_path)
+                continue  # Recycle the loop immediately without calling the LLM
             t_start = time.perf_counter()
             # In memory WAV representation
             # wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
