@@ -335,21 +335,27 @@ def stream_and_process(streamer):
     payload_dispatched = False
     active_phrase = ""
     current_speed = 1.0
+    full_verbal_response = ""
     print("[Streamer] Reading token stream from LLM pipeline...")
     for token in streamer:
         accumulated_text += token
         # Detect completion of the JSON payload section
         if not payload_dispatched and "\n\n" in accumulated_text:
             json_part, verbal_start = accumulated_text.split("\n\n", 1)
-            print(f"[NLU Parser] Found separator '\\n\\n'. Extracted JSON block: '{json_part.strip()}'")
+            print("\n" + "=" * 60)
+            print("[NLU Parser] EXTRAPOLATED JSON PAYLOAD (Pre-Dispatch):")
+            print(json_part.strip())
+            print("=" * 60 + "\n")
             dispatch_ha_async(json_part)
             payload_dispatched = True
             accumulated_text = verbal_start
             active_phrase = verbal_start
+            full_verbal_response += verbal_start
             continue
         if not payload_dispatched:
             continue
         active_phrase += token
+        full_verbal_response += token
         # Handle inline prosody tags as they emerge
         tag_match = re.search(r'(<[^>]+>)', active_phrase)
         if tag_match:
@@ -386,6 +392,10 @@ def stream_and_process(streamer):
     if final_chunk:
         print(f"[Streamer] Flushing terminal tokens to queue: \"{final_chunk}\"")
         AUDIO_QUEUE.put(("TEXT", final_chunk))
+    print("\n" + "=" * 60)
+    print("[LLM Pipeline] STREAM COMPLETE: GLaDOS Response Summary")
+    print(f"Decoded Spoken Output: \"{full_verbal_response.strip()}\"")
+    print("=" * 60 + "\n")
 
 def main():
     print("\n" + "=" * 80)
