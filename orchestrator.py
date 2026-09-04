@@ -1,6 +1,7 @@
 import sys
 import os
 import warnings
+import logging
 import tempfile
 from contextlib import contextmanager
 import subprocess
@@ -28,7 +29,11 @@ except ImportError:
 warnings.filterwarnings("ignore", category=FutureWarning, module="bitsandbytes")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning)
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+os.environ["TORCH_LOGS"] = "-all"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+logging.getLogger("torch").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 # CONFIGURATION
 MODEL_ID = "mistralai/Voxtral-Mini-3B-2507"
 LORA_PATH = "./models/voxtral-glados-sft/final_adapters"
@@ -89,15 +94,16 @@ def managed_temp_audio_file(filepath: str):
     A context manager that ensures a physical audio file is cleanly deleted
     from disk after the block exits, even if exceptions are thrown during processing.
     """
+    print(f"[File System] Initializing transient audio buffer on disk: '{filepath}'")
     try:
         yield filepath
     finally:
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
-                # print(f"[Cleanup] Deleted transient file: {filepath}")
+                print(f"[Cleanup] Deleted temp file: {filepath}")
         except OSError as err:
-            print(f"[Cleanup Warning] Failed to delete transient file: {err}")
+            print(f"[Cleanup Warning] Failed to delete temp file: {err}")
 
 def play_audio_native(audio_array, sample_rate=22050):
     """
@@ -156,7 +162,7 @@ def calibrate_noise_floor(duration=3.0):
     Records a brief segment of ambient silence at startup
     to dynamically calculate your room's noise floor.
     """
-    print("[Calibration] Measuring background noise floor... Please remain silent.")
+    print("[VAD Calibration] Measuring background noise floor... Please remain silent.")
     temp_path = "/tmp/calibration.wav"
     # Record ambient background using our native PulseAudio utility
     record_audio_native(temp_path, duration=duration)
@@ -171,11 +177,11 @@ def calibrate_noise_floor(duration=3.0):
         rms_noise = np.sqrt(np.mean(normalized ** 2))
         # Set silence threshold to 2.5x the noise floor to establish a safe signal-to-noise ratio
         calibrated_threshold = max(rms_noise * 2.5, 0.008)
-        print(f"[Calibration] Ambient noise RMS: {rms_noise:.5f}")
-        print(f"[Calibration] Dynamic silence threshold set to: {calibrated_threshold:.5f}")
+        print(f"[VAD Calibration] Ambient noise RMS: {rms_noise:.5f}")
+        print(f"[VAD Calibration] Dynamic silence threshold set to: {calibrated_threshold:.5f}")
         return calibrated_threshold
     except Exception as err:
-        print(f"[Calibration Warning] Calibration failed ({err}). Using default threshold 0.012.")
+        print(f"[VAD Calibration Warning] Calibration failed ({err}). Using default threshold 0.012.")
         return 0.012
     finally:
         if os.path.exists(temp_path):
@@ -195,10 +201,14 @@ def is_audio_silent(filepath, threshold):
         else:
             normalized = data
         rms = np.sqrt(np.mean(normalized ** 2))
-        print(f"[VAD Diagnostic] Captured Segment RMS: {rms:.5f} | Threshold: {threshold:.5f}")
-        return rms < threshold
+        if rms < threshold:
+            print(f"[VAD Diagnostic] Silence Detected (RMS: {rms:.5f} < Threshold: {threshold:.5f})")
+            return True
+        else:
+            print(f"[VAD Diagnostic] Speech Detected (RMS: {rms:.5f} >= Threshold: {threshold:.5f})")
+            return False
     except Exception as err:
-        print(f"[VAD Error] Failed to read audio file for verification: {err}")
+        print(f"[VAD Error] Dynamic evaluation failed: {err}")
         return True
 
 # INITIALIZATION
@@ -242,6 +252,7 @@ def dispatch_ha_async(payload_text):
     Does not block the token streaming or speech pipeline.
     """
     def _execute():
+        print("[HA API] Thread spawned. Extracting JSON blocks from model outputs...")
         matches = re.finditer(r'(\{.*?\})', payload_text, re.DOTALL)
         for match in matches:
             try:
@@ -260,15 +271,16 @@ def dispatch_ha_async(payload_text):
                 for key, val in payload.items():
                     if key not in ["service", "target_device"]:
                         body[key] = val
+                print(f"[HA API] Dispatching REST request to: {endpoint} | Payload: {body}")
                 t0 = time.perf_counter()
                 resp = requests.post(endpoint, headers=HA_HEADERS, json=body, timeout=2.0)
                 latency = (time.perf_counter() - t0) * 1000
                 if resp.ok:
-                    print(f"\n[HA OK] >> {service_call} ({latency:.1f} ms)")
+                    print(f"\n[HA API OK] >> {service_call} ({latency:.1f} ms)")
                 else:
-                    print(f"\n[HA ERROR] >> Request failed: {resp.status_code}")
+                    print(f"\n[HA API ERROR] >> Request failed: {resp.status_code}")
             except Exception as err:
-                print(f"\n[HA ERROR] >> Execution failed: {err}")
+                print(f"\n[HA API ERROR] >> Execution failed: {err}")
     thread = threading.Thread(target=_execute, daemon=True)
     thread.start()
 
@@ -279,26 +291,35 @@ def tts_playback_worker():
     Runs concurrently with token generation.
     """
     current_speed = 1.0
+    print("[TTS Playback] Thread spawned. Monitoring AUDIO_QUEUE for events...")
     while True:
         item = AUDIO_QUEUE.get()
         if item is None:
+            print("[TTS Playback] Received poison pill. Shutting down worker thread.")
             break
         tag_type, content = item
         IS_SPEAKING.set()
         try:
             if tag_type == "PAUSE":
-                time.sleep(0.35)
+                print(f"[TTS Playback] Executing silent pause for {content}s...")
+                time.sleep(float(content))
             elif tag_type == "SPEED":
                 current_speed = float(content)
+                print(f"[TTS Playback] Playback speed updated to: {current_speed}x")
             elif tag_type == "TEXT":
                 if content.strip():
+                    print(f"[TTS Playback] Synthesizing audio for phrase: \"{content}\"")
                     audio = GLADOS_ENGINE.generate_speech_audio(content)
                     if audio is not None and len(audio) > 0:
                         # If the speed tag is active, mathematically stretch the audio.
                         if current_speed != 1.0:
+                            print(f"[TTS Playback] Stretching vocal arrays on CPU (factor: {current_speed}x)...")
                             # librosa requires a 1D floating-point array
                             audio = librosa.effects.time_stretch(y=audio, rate=current_speed)
+                            print(f"[TTS Playback] Routing {len(audio)} float32 elements to speakers...")
                         play_audio_native(audio, sample_rate=22050)
+                        print("[TTS Playback] Hardware channel buffer cleared.")
+
         finally:
             if AUDIO_QUEUE.empty():
                 IS_SPEAKING.clear()
@@ -314,11 +335,13 @@ def stream_and_process(streamer):
     payload_dispatched = False
     active_phrase = ""
     current_speed = 1.0
+    print("[Streamer] Reading token stream from LLM pipeline...")
     for token in streamer:
         accumulated_text += token
         # Detect completion of the JSON payload section
         if not payload_dispatched and "\n\n" in accumulated_text:
             json_part, verbal_start = accumulated_text.split("\n\n", 1)
+            print(f"[NLU Parser] Found separator '\\n\\n'. Extracted JSON block: '{json_part.strip()}'")
             dispatch_ha_async(json_part)
             payload_dispatched = True
             accumulated_text = verbal_start
@@ -333,16 +356,21 @@ def stream_and_process(streamer):
             tag = tag_match.group(1)
             before_tag = active_phrase[:tag_match.start()].strip()
             if before_tag:
+                print(f"[Streamer] Pushed verbal segment to play queue: \"{before_tag}\"")
                 AUDIO_QUEUE.put(("TEXT", before_tag))
             if tag == "<pause>":
+                print("[Streamer] Parsed tag: <pause> -> Queuing 300ms pause interval")
                 AUDIO_QUEUE.put(("PAUSE", 0.30))
             elif tag == "<sigh>":
+                print("[Streamer] Parsed tag: <sigh> -> Queuing spoken sigh string")
                 AUDIO_QUEUE.put(("TEXT", "sigh"))
             elif tag == "<fast>":
                 current_speed = 1.20
+                print(f"[Streamer] Parsed tag: <fast> -> Setting tempo multiplier to {current_speed}x")
                 AUDIO_QUEUE.put(("SPEED", current_speed))
             elif tag == "<slow_deadpan>":
                 current_speed = 0.85
+                print(f"[Streamer] Parsed tag: <slow_deadpan> -> Setting tempo multiplier to {current_speed}x")
                 AUDIO_QUEUE.put(("SPEED", current_speed))
             active_phrase = active_phrase[tag_match.end():]
             continue
@@ -350,14 +378,19 @@ def stream_and_process(streamer):
         if any(punct in token for punct in [".", "!", "?", ","]):
             clean_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
             if clean_chunk:
+                print(f"[Streamer] Punctuation boundary hit. Pushing to queue: \"{clean_chunk}\"")
                 AUDIO_QUEUE.put(("TEXT", clean_chunk))
             active_phrase = ""
     # Flush any remaining tokens
     final_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
     if final_chunk:
+        print(f"[Streamer] Flushing terminal tokens to queue: \"{final_chunk}\"")
         AUDIO_QUEUE.put(("TEXT", final_chunk))
 
 def main():
+    print("\n" + "=" * 80)
+    print(" GLaDOS SYSTEM INTELLIGENCE ORCHESTRATOR - INFERENCE ENTRANCE".center(80))
+    print("=" * 80)
     processor, model = initialize_subsystems()
     # recognizer = sr.Recognizer()
     # recognizer.energy_threshold = 300
@@ -369,12 +402,15 @@ def main():
     tts_thread.start()
     # Run ambient sound calibration prior the activation of the pipeline
     SILENCE_THRESHOLD = calibrate_noise_floor(duration=1.5)
-    print("\n[Active] High-efficiency streaming orchestrator ready.")
+    print("\n[Active] High efficiency streaming orchestrator ready.")
     try:
         while True:
+            print("[Status] GLaDOS is currently speaking. Muting microphone and waiting...")
             # Wait for any lingering playback before opening microphone
             while IS_SPEAKING.is_set():
-                time.sleep(0.02)
+                time.sleep(0.05)
+            print("[Status] Vocal response completed. Activating recording stream...")
+
             # with microphone as source:
             #     recognizer.adjust_for_ambient_noise(source, duration=0.3)
             #     print("\n[Listening] Speak your command...")
@@ -384,7 +420,7 @@ def main():
 
             # Intercept empty or purely noisy recordings before they hit the GPU
             if is_audio_silent(raw_audio_path, SILENCE_THRESHOLD):
-                print("[VAD] Silence or ambient room noise detected. Skipping inference.")
+                print("[VAD Diagnostic] Silence or ambient room noise detected. Skipping inference.")
                 if os.path.exists(raw_audio_path):
                     os.remove(raw_audio_path)
                 continue  # Recycle the loop immediately without calling the LLM
@@ -402,6 +438,7 @@ def main():
                         ]
                     }
                 ]
+                print("[LLM Pipeline] Compiling multimodal input tokens and processing spectrogram...")
                 inputs = processor.apply_chat_template(
                     conversations,
                     add_generation_prompt=True,
@@ -421,17 +458,25 @@ def main():
                 repetition_penalty=1.05,
                 use_cache=True
             )
+            print("[LLM Pipeline] Dispatching generation config parameters to GPU background thread...")
             # Run autoregressive generation in background thread while processing streamer on main thread
             gen_thread = threading.Thread(target=lambda: model.generate(**generate_kwargs))
             gen_thread.start()
-            print(f"[Profiling] Preprocessing & prompt encoding took: {(time.perf_counter() - t_start) * 1000:.1f} ms")
+            # Profile preprocessing execution
+            t_preprocess = (time.perf_counter() - t_start) * 1000
+            print(f"[Profiling] Spectrogram features mapped to GPU in: {t_preprocess:.1f} ms")
             # Stream tokens: triggers HA early and pipelines TTS
             stream_and_process(streamer)
             gen_thread.join()
+            print("[LLM Pipeline] Autoregressive decoding complete.")
             # Ensure all queued audio chunks finish playing
+            print("[Status] Awaiting vocal queue flush before recycling loop...")
             AUDIO_QUEUE.join()
+            print("[Status] Speech completed. Recycling interface.\n" + "-"*80)
     except KeyboardInterrupt:
-        print("\n[Shutdown] Orchestrator halted.")
+        print("\n" + "=" * 80)
+        print(" ORCHESTRATOR SHUTDOWN INITIATED ".center(80))
+        print("=" * 80)
         AUDIO_QUEUE.put(None)
 
 if __name__ == "__main__":
