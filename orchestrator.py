@@ -50,9 +50,7 @@ SYSTEM_INSTRUCTION = (
     f"You are GLaDOS, an AI assistant that controls the devices in a house. "
     f"Execute the spoken command, output the required JSON payload, and respond in character. "
     f"Complete the following task as instructed or answer the following question with the information provided only.\n"
-    f"Services: climate.set_fan_mode(fan_mode), climate.set_humidity(humidity), "
-    f"climate.set_hvac_mode(), climate.set_preset_mode(), climate.set_temperature(temperature), "
-    f"climate.toggle(), climate.turn_off(), climate.turn_on(), cover.close_cover(), "
+    f"Services: cover.close_cover(), "
     f"cover.open_cover(), cover.stop_cover(), cover.toggle(), fan.decrease_speed(), "
     f"fan.increase_speed(), fan.toggle(), fan.turn_off(), fan.turn_on(), light.toggle(), "
     f"light.turn_off(), light.turn_on(rgb_color,brightness), lock.lock(), lock.unlock(), "
@@ -269,6 +267,21 @@ def dispatch_ha_async(payload_text):
     thread.start()
 
 # SPEECH WORKER THREAD
+def adjust_speech_cadence(audio_array, speed_mode, sample_rate=22050):
+    """
+    Uses a Phase Vocoder to stretch or compress audio in the frequency domain.
+    This changes the speed while locking the pitch, avoiding mid word chopping.
+    """
+    # Skip DSP entirely for normal speech
+    if speed_mode == 1.0:
+        return audio_array
+    # Ensure the matrix is flattened to 1D
+    audio_array = np.asarray(audio_array).flatten()
+    # Execute the Phase Vocoder algorithm
+    # speed_mode > 1.0 makes it faster, speed_mode < 1.0 makes it slower
+    stretched_audio = librosa.effects.time_stretch(y=audio_array, rate=speed_mode)
+    return stretched_audio
+
 def tts_playback_worker():
     """
     Continuously consumes text and prosody events from the queue and plays audio.
@@ -294,8 +307,7 @@ def tts_playback_worker():
                     if audio is not None and len(audio) > 0:
                         # If the speed tag is active, mathematically stretch the audio.
                         if current_speed != 1.0:
-                            # librosa requires a 1D floating-point array
-                            audio = librosa.effects.time_stretch(y=audio, rate=current_speed)
+                            audio = adjust_speech_cadence(audio, current_speed, sample_rate=22050)
                         play_audio(audio, sample_rate=22050)
         finally:
             if AUDIO_QUEUE.empty():
@@ -352,15 +364,15 @@ def stream_and_process(streamer):
                 AUDIO_QUEUE.put(("TEXT", before_tag))
             # Dispatch the specific instruction
             if tag == "<pause>":
-                AUDIO_QUEUE.put(("PAUSE", 0.2))
                 AUDIO_QUEUE.put(("SPEED", 1.0))
+                AUDIO_QUEUE.put(("PAUSE", 0.2))
             elif tag == "<sigh>":
+                AUDIO_QUEUE.put(("SPEED", 1.0))
                 AUDIO_QUEUE.put(("TEXT", "sigh"))
-                AUDIO_QUEUE.put(("SPEED", 0.1))
             elif tag == "<fast>":
-                AUDIO_QUEUE.put(("SPEED", 1.5))
+                AUDIO_QUEUE.put(("SPEED", 1.15))
             elif tag == "<slow_deadpan>":
-                AUDIO_QUEUE.put(("SPEED", 0.75))
+                AUDIO_QUEUE.put(("SPEED", 0.85))
             # Remove the processed portion from the buffer
             active_phrase = active_phrase[match.end():]
     # Stream Termination Flush
