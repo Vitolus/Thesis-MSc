@@ -88,24 +88,7 @@ AUDIO_QUEUE = queue.Queue()
 IS_SPEAKING = threading.Event()
 
 # HELPER FUNCTIONS
-@contextmanager
-def managed_temp_audio_file(filepath: str):
-    """
-    A context manager that ensures a physical audio file is cleanly deleted
-    from disk after the block exits, even if exceptions are thrown during processing.
-    """
-    print(f"[File System] Initializing transient audio buffer on disk: '{filepath}'")
-    try:
-        yield filepath
-    finally:
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-                print(f"[Cleanup] Deleted temp file: {filepath}")
-        except OSError as err:
-            print(f"[Cleanup Warning] Failed to delete temp file: {err}")
-
-def play_audio_native(audio_array, sample_rate=22050):
+def play_audio(audio_array, sample_rate=22050):
     """
     Plays a NumPy float32 audio array by converting it to 16-bit PCM
     and writing it directly to the system's paplay stdin.
@@ -129,14 +112,15 @@ def play_audio_native(audio_array, sample_rate=22050):
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         process.communicate(input=pcm_data)
     except Exception as err:
-        print(f"[Playback Error] Native PulseAudio pipeline failed: {err}")
+        print(f"[Playback Error] Native PulseAudio pipeline failed: {err}\n")
 
-def record_audio_native(output_path="/tmp/user_input.wav", duration=5):
+def record_audio(output_path="./test/user_input.wav"):
     """
-    Captures input from the default PulseAudio source (mapped to VoiceMeeter B1)
-    and saves it directly as a 16kHz Mono WAV file using parecord.
+    Push-To-Talk recording flow.
+    Launches parecord on a keypress trigger and terminates it on the second keypress.
     """
-    print(f"\n[Listening] Speak now (Recording for {duration} seconds)...")
+    input("[PTT] Press [ENTER] to START recording GLaDOS command...")
+    print("[PTT] >>> RECORDING ACTIVE <<< Speak now...")
     cmd = [
         "parecord",
         "--channels=1",
@@ -147,14 +131,12 @@ def record_audio_native(output_path="/tmp/user_input.wav", duration=5):
     ]
     # Spawn the native PulseAudio recording utility as a background task
     process = subprocess.Popen(cmd)
-    try:
-        # Record for the designated duration
-        time.sleep(duration)
-    finally:
-        # Force terminate the recording process and let the file write complete
-        process.terminate()
-        process.wait()
-    print("[Listening] Recording completed successfully.")
+    # Wait for the user to trigger the stop
+    input("[PTT] Press [ENTER] to STOP recording and analyze...")
+    # Terminate the process and let it finalize WAV headers
+    process.terminate()
+    process.wait()
+    print(f"[PTT] Recording stopped. Audio successfully saved to: '{output_path}'\n")
     return output_path
 
 def calibrate_noise_floor(duration=3.0):
@@ -162,10 +144,24 @@ def calibrate_noise_floor(duration=3.0):
     Records a brief segment of ambient silence at startup
     to dynamically calculate your room's noise floor.
     """
-    print("[VAD Calibration] Measuring background noise floor... Please remain silent.")
     temp_path = "/tmp/calibration.wav"
     # Record ambient background using our native PulseAudio utility
-    record_audio_native(temp_path, duration=duration)
+    cmd = [
+        "parecord",
+        "--channels=1",
+        "--rate=16000",
+        "--format=s16le",
+        "--file-format=wav",
+        temp_path
+    ]
+    process = subprocess.Popen(cmd)
+    try:
+        # Record for the designated duration
+        time.sleep(duration)
+    finally:
+        # Force terminate the recording process and let the file write complete
+        process.terminate()
+        process.wait()
     try:
         sample_rate, data = wav.read(temp_path)
         # Normalize 16-bit integers to float range [-1.0, 1.0] for math consistency
@@ -177,11 +173,9 @@ def calibrate_noise_floor(duration=3.0):
         rms_noise = np.sqrt(np.mean(normalized ** 2))
         # Set silence threshold to 2.5x the noise floor to establish a safe signal-to-noise ratio
         calibrated_threshold = max(rms_noise * 2.5, 0.008)
-        print(f"[VAD Calibration] Ambient noise RMS: {rms_noise:.5f}")
-        print(f"[VAD Calibration] Dynamic silence threshold set to: {calibrated_threshold:.5f}")
         return calibrated_threshold
     except Exception as err:
-        print(f"[VAD Calibration Warning] Calibration failed ({err}). Using default threshold 0.012.")
+        print(f"[VAD Calibration Warning] Calibration failed ({err}).\n")
         return 0.012
     finally:
         if os.path.exists(temp_path):
@@ -202,13 +196,11 @@ def is_audio_silent(filepath, threshold):
             normalized = data
         rms = np.sqrt(np.mean(normalized ** 2))
         if rms < threshold:
-            print(f"[VAD Diagnostic] Silence Detected (RMS: {rms:.5f} < Threshold: {threshold:.5f})")
             return True
         else:
-            print(f"[VAD Diagnostic] Speech Detected (RMS: {rms:.5f} >= Threshold: {threshold:.5f})")
             return False
     except Exception as err:
-        print(f"[VAD Error] Dynamic evaluation failed: {err}")
+        print(f"[VAD Error] Silence evaluation failed: {err}")
         return True
 
 # INITIALIZATION
@@ -242,7 +234,7 @@ def initialize_subsystems():
         is_trainable=False
     )
     model.eval()
-    print("[INIT] Multimodal SLU pipeline active.")
+    print("[INIT] Multimodal SLU pipeline active.\n")
     return processor, model
 
 # ASYNCHRONOUS HOME ASSISTANT
@@ -276,11 +268,11 @@ def dispatch_ha_async(payload_text):
                 resp = requests.post(endpoint, headers=HA_HEADERS, json=body, timeout=2.0)
                 latency = (time.perf_counter() - t0) * 1000
                 if resp.ok:
-                    print(f"\n[HA API OK] >> {service_call} ({latency:.1f} ms)")
+                    print(f"[HA API OK] >> {service_call} ({latency:.1f} ms)\n")
                 else:
-                    print(f"\n[HA API ERROR] >> Request failed: {resp.status_code}")
+                    print(f"[HA API ERROR] >> Request failed: {resp.status_code}\n")
             except Exception as err:
-                print(f"\n[HA API ERROR] >> Execution failed: {err}")
+                print(f"[HA API ERROR] >> Execution failed: {err}\n")
     thread = threading.Thread(target=_execute, daemon=True)
     thread.start()
 
@@ -301,24 +293,18 @@ def tts_playback_worker():
         IS_SPEAKING.set()
         try:
             if tag_type == "PAUSE":
-                print(f"[TTS Playback] Executing silent pause for {content}s...")
                 time.sleep(float(content))
             elif tag_type == "SPEED":
                 current_speed = float(content)
-                print(f"[TTS Playback] Playback speed updated to: {current_speed}x")
             elif tag_type == "TEXT":
                 if content.strip():
-                    print(f"[TTS Playback] Synthesizing audio for phrase: \"{content}\"")
                     audio = GLADOS_ENGINE.generate_speech_audio(content)
                     if audio is not None and len(audio) > 0:
                         # If the speed tag is active, mathematically stretch the audio.
                         if current_speed != 1.0:
-                            print(f"[TTS Playback] Stretching vocal arrays on CPU (factor: {current_speed}x)...")
                             # librosa requires a 1D floating-point array
                             audio = librosa.effects.time_stretch(y=audio, rate=current_speed)
-                            print(f"[TTS Playback] Routing {len(audio)} float32 elements to speakers...")
-                        play_audio_native(audio, sample_rate=22050)
-                        print("[TTS Playback] Hardware channel buffer cleared.")
+                        play_audio(audio, sample_rate=22050)
 
         finally:
             if AUDIO_QUEUE.empty():
@@ -336,16 +322,15 @@ def stream_and_process(streamer):
     active_phrase = ""
     current_speed = 1.0
     full_verbal_response = ""
-    print("[Streamer] Reading token stream from LLM pipeline...")
     for token in streamer:
         accumulated_text += token
         # Detect completion of the JSON payload section
         if not payload_dispatched and "\n\n" in accumulated_text:
             json_part, verbal_start = accumulated_text.split("\n\n", 1)
-            print("\n" + "=" * 60)
-            print("[NLU Parser] EXTRAPOLATED JSON PAYLOAD (Pre-Dispatch):")
+            print("=" * 60)
+            print("[NLU Parser] EXTRAPOLATED JSON PAYLOAD:")
             print(json_part.strip())
-            print("=" * 60 + "\n")
+            print("=" * 60)
             dispatch_ha_async(json_part)
             payload_dispatched = True
             accumulated_text = verbal_start
@@ -362,21 +347,16 @@ def stream_and_process(streamer):
             tag = tag_match.group(1)
             before_tag = active_phrase[:tag_match.start()].strip()
             if before_tag:
-                print(f"[Streamer] Pushed verbal segment to play queue: \"{before_tag}\"")
                 AUDIO_QUEUE.put(("TEXT", before_tag))
             if tag == "<pause>":
-                print("[Streamer] Parsed tag: <pause> -> Queuing 300ms pause interval")
                 AUDIO_QUEUE.put(("PAUSE", 0.30))
             elif tag == "<sigh>":
-                print("[Streamer] Parsed tag: <sigh> -> Queuing spoken sigh string")
                 AUDIO_QUEUE.put(("TEXT", "sigh"))
             elif tag == "<fast>":
                 current_speed = 1.20
-                print(f"[Streamer] Parsed tag: <fast> -> Setting tempo multiplier to {current_speed}x")
                 AUDIO_QUEUE.put(("SPEED", current_speed))
             elif tag == "<slow_deadpan>":
                 current_speed = 0.85
-                print(f"[Streamer] Parsed tag: <slow_deadpan> -> Setting tempo multiplier to {current_speed}x")
                 AUDIO_QUEUE.put(("SPEED", current_speed))
             active_phrase = active_phrase[tag_match.end():]
             continue
@@ -384,78 +364,60 @@ def stream_and_process(streamer):
         if any(punct in token for punct in [".", "!", "?", ","]):
             clean_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
             if clean_chunk:
-                print(f"[Streamer] Punctuation boundary hit. Pushing to queue: \"{clean_chunk}\"")
                 AUDIO_QUEUE.put(("TEXT", clean_chunk))
             active_phrase = ""
     # Flush any remaining tokens
     final_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
     if final_chunk:
-        print(f"[Streamer] Flushing terminal tokens to queue: \"{final_chunk}\"")
         AUDIO_QUEUE.put(("TEXT", final_chunk))
-    print("\n" + "=" * 60)
     print("[LLM Pipeline] STREAM COMPLETE: GLaDOS Response Summary")
     print(f"Decoded Spoken Output: \"{full_verbal_response.strip()}\"")
     print("=" * 60 + "\n")
 
-def main():
-    print("\n" + "=" * 80)
+if __name__ == "__main__":
+    print("=" * 80)
     print(" GLaDOS SYSTEM INTELLIGENCE ORCHESTRATOR - INFERENCE ENTRANCE".center(80))
     print("=" * 80)
     processor, model = initialize_subsystems()
-    # recognizer = sr.Recognizer()
-    # recognizer.energy_threshold = 300
-    # recognizer.dynamic_energy_threshold = True
-    # microphone = sr.Microphone(sample_rate=16000)
-
     # Start persistent TTS background thread
     tts_thread = threading.Thread(target=tts_playback_worker, daemon=True)
     tts_thread.start()
     # Run ambient sound calibration prior the activation of the pipeline
-    SILENCE_THRESHOLD = calibrate_noise_floor(duration=1.5)
-    print("\n[Active] High efficiency streaming orchestrator ready.")
+    print("[VAD Calibration] Measuring background noise floor... Please remain silent.")
+    SILENCE_THRESHOLD = calibrate_noise_floor(duration=2.0)
+    print(f"[VAD Calibration] Silence threshold set to: {SILENCE_THRESHOLD:.5f}")
+    print("[Active] Orchestrator ready.")
+    AUDIO_PATH = "./test/user_input.wav"
     try:
         while True:
             print("[Status] GLaDOS is currently speaking. Muting microphone and waiting...")
             # Wait for any lingering playback before opening microphone
             while IS_SPEAKING.is_set():
                 time.sleep(0.05)
-            print("[Status] Vocal response completed. Activating recording stream...")
-
-            # with microphone as source:
-            #     recognizer.adjust_for_ambient_noise(source, duration=0.3)
-            #     print("\n[Listening] Speak your command...")
-            #     audio = recognizer.listen(source, phrase_time_limit=8)
-            raw_audio_path = "/tmp/user_input.wav"
-            record_audio_native(raw_audio_path, duration=5)
-
+            print("[Status] Vocal response completed. Activating recording stream...\n")
+            record_audio(AUDIO_PATH)
             # Intercept empty or purely noisy recordings before they hit the GPU
-            if is_audio_silent(raw_audio_path, SILENCE_THRESHOLD):
-                print("[VAD Diagnostic] Silence or ambient room noise detected. Skipping inference.")
-                if os.path.exists(raw_audio_path):
-                    os.remove(raw_audio_path)
+            if is_audio_silent(AUDIO_PATH, SILENCE_THRESHOLD):
+                print("[VAD Diagnostic] Silence or ambient room noise detected. Skipping inference.\n")
                 continue  # Recycle the loop immediately without calling the LLM
             t_start = time.perf_counter()
-            # In memory WAV representation
-            # wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            # with managed_temp_audio(wav_bytes) as temp_wav_path:
-            with managed_temp_audio_file(raw_audio_path) as temp_wav_path:
-                conversations = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": SYSTEM_INSTRUCTION},
-                            {"type": "audio", "path": temp_wav_path}
-                        ]
-                    }
-                ]
-                print("[LLM Pipeline] Compiling multimodal input tokens and processing spectrogram...")
-                inputs = processor.apply_chat_template(
-                    conversations,
-                    add_generation_prompt=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                    processor_kwargs={"padding": False}
-                ).to(model.device, dtype=COMPUTE_DTYPE)
+            conversations = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": SYSTEM_INSTRUCTION},
+                        {"type": "audio", "path": AUDIO_PATH}
+                    ]
+                }
+            ]
+            print("[LLM Pipeline] Compiling multimodal input tokens and processing spectrogram...")
+            inputs = processor.apply_chat_template(
+                conversations,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                processor_kwargs={"padding": False}
+            ).to(model.device, dtype=COMPUTE_DTYPE)
             # Set up non-blocking token streaming
             streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
             generate_kwargs = dict(
@@ -474,7 +436,7 @@ def main():
             gen_thread.start()
             # Profile preprocessing execution
             t_preprocess = (time.perf_counter() - t_start) * 1000
-            print(f"[Profiling] Spectrogram features mapped to GPU in: {t_preprocess:.1f} ms")
+            print(f"[Profiling] Spectrogram features mapped to GPU in: {t_preprocess:.1f} ms\n")
             # Stream tokens: triggers HA early and pipelines TTS
             stream_and_process(streamer)
             gen_thread.join()
@@ -482,12 +444,9 @@ def main():
             # Ensure all queued audio chunks finish playing
             print("[Status] Awaiting vocal queue flush before recycling loop...")
             AUDIO_QUEUE.join()
-            print("[Status] Speech completed. Recycling interface.\n" + "-"*80)
+            print("[Status] Speech completed. Recycling interface.\n" + "-" * 80)
     except KeyboardInterrupt:
-        print("\n" + "=" * 80)
+        print("=" * 80)
         print(" ORCHESTRATOR SHUTDOWN INITIATED ".center(80))
         print("=" * 80)
         AUDIO_QUEUE.put(None)
-
-if __name__ == "__main__":
-    main()
