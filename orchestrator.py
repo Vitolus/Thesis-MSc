@@ -2,8 +2,6 @@ import sys
 import os
 import warnings
 import logging
-import tempfile
-from contextlib import contextmanager
 import subprocess
 import re
 import json
@@ -45,6 +43,8 @@ HA_HEADERS = {
     "Authorization": f"Bearer {HA_TOKEN}",
     "Content-Type": "application/json"
 }
+TAG_REGEX = re.compile(r'(<[^>]+>)')
+JSON_EXTRACT_REGEX = re.compile(r'(\{.*?\})', re.DOTALL)
 # Training prompt format
 SYSTEM_INSTRUCTION = (
     f"You are GLaDOS, an AI assistant that controls the devices in a house. "
@@ -87,7 +87,41 @@ GLADOS_ENGINE = None
 AUDIO_QUEUE = queue.Queue()
 IS_SPEAKING = threading.Event()
 
-# HELPER FUNCTIONS
+# INITIALIZATION
+def initialize_subsystems():
+    global GLADOS_ENGINE
+    print("[INIT] Loading GLaDOS-TTS engine...")
+    GLADOS_ENGINE = glados.TTS()
+    print(f"[INIT] Loading 4-bit Voxtral ({MODEL_ID})...")
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=COMPUTE_DTYPE
+    )
+    base_model = VoxtralForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        quantization_config=bnb_config,
+        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        dtype=COMPUTE_DTYPE
+    )
+    peft_config = PeftConfig.from_pretrained(LORA_PATH)
+    peft_config.init_lora_weights = False
+    print(f"[INIT] Attaching LoRA adapter from {LORA_PATH}...")
+    model = PeftModel.from_pretrained(
+        base_model,
+        LORA_PATH,
+        config=peft_config,
+        is_trainable=False
+    )
+    model.eval()
+    print("[INIT] Multimodal SLU pipeline active.\n")
+    return processor, model
+
+# AUDIO FUNCTIONS
 def play_audio(audio_array, sample_rate=22050):
     """
     Plays a NumPy float32 audio array by converting it to 16-bit PCM
@@ -166,14 +200,11 @@ def calibrate_noise_floor(duration=3.0):
         sample_rate, data = wav.read(temp_path)
         # Normalize 16-bit integers to float range [-1.0, 1.0] for math consistency
         if data.dtype == np.int16:
-            normalized = data / 32768.0
-        else:
-            normalized = data
+            data = data.astype(np.float32) / 32768.0
         # Calculate Root Mean Square energy
-        rms_noise = np.sqrt(np.mean(normalized ** 2))
+        rms_noise = np.sqrt(np.mean(data ** 2))
         # Set silence threshold to 2.5x the noise floor to establish a safe signal-to-noise ratio
-        calibrated_threshold = max(rms_noise * 2.5, 0.008)
-        return calibrated_threshold
+        return max(rms_noise * 2.5, 0.008)
     except Exception as err:
         print(f"[VAD Calibration Warning] Calibration failed ({err}).\n")
         return 0.012
@@ -191,53 +222,14 @@ def is_audio_silent(filepath, threshold):
         if len(data) == 0:
             return True
         if data.dtype == np.int16:
-            normalized = data / 32768.0
-        else:
-            normalized = data
-        rms = np.sqrt(np.mean(normalized ** 2))
-        if rms < threshold:
-            return True
-        else:
-            return False
+            data = data.astype(np.float32) / 32768.0
+        rms = np.sqrt(np.mean(data ** 2))
+        return rms < threshold
     except Exception as err:
         print(f"[VAD Error] Silence evaluation failed: {err}")
         return True
 
-# INITIALIZATION
-def initialize_subsystems():
-    global GLADOS_ENGINE
-    print("[INIT] Loading GLaDOS-TTS engine...")
-    GLADOS_ENGINE = glados.TTS()
-    print(f"[INIT] Loading 4-bit Voxtral ({MODEL_ID})...")
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=COMPUTE_DTYPE
-    )
-    base_model = VoxtralForConditionalGeneration.from_pretrained(
-        MODEL_ID,
-        quantization_config=bnb_config,
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
-        device_map="auto",
-        low_cpu_mem_usage=True,
-        dtype=COMPUTE_DTYPE
-    )
-    peft_config = PeftConfig.from_pretrained(LORA_PATH)
-    peft_config.init_lora_weights = False
-    print(f"[INIT] Attaching LoRA adapter from {LORA_PATH}...")
-    model = PeftModel.from_pretrained(
-        base_model,
-        LORA_PATH,
-        config=peft_config,
-        is_trainable=False
-    )
-    model.eval()
-    print("[INIT] Multimodal SLU pipeline active.\n")
-    return processor, model
-
-# ASYNCHRONOUS HOME ASSISTANT
+# HOME ASSISTANT THREAD
 def dispatch_ha_async(payload_text):
     """
     Parses and fires the Home Assistant REST request in a dedicated daemon thread.
@@ -245,7 +237,7 @@ def dispatch_ha_async(payload_text):
     """
     def _execute():
         print("[HA API] Thread spawned. Extracting JSON blocks from model outputs...")
-        matches = re.finditer(r'(\{.*?\})', payload_text, re.DOTALL)
+        matches = JSON_EXTRACT_REGEX.finditer(payload_text)
         for match in matches:
             try:
                 payload = json.loads(match.group(1))
@@ -276,18 +268,18 @@ def dispatch_ha_async(payload_text):
     thread = threading.Thread(target=_execute, daemon=True)
     thread.start()
 
-# PIPELINED SPEECH WORKER THREAD
+# SPEECH WORKER THREAD
 def tts_playback_worker():
     """
     Continuously consumes text and prosody events from the queue and plays audio.
     Runs concurrently with token generation.
     """
     current_speed = 1.0
-    print("[TTS Playback] Thread spawned. Monitoring AUDIO_QUEUE for events...")
+    print("[TTS Playback] Thread spawned. Monitoring AUDIO_QUEUE for events.\n")
     while True:
         item = AUDIO_QUEUE.get()
         if item is None:
-            print("[TTS Playback] Received poison pill. Shutting down worker thread.")
+            print("[TTS Playback] Received poison pill. Shutting down worker thread.\n")
             break
         tag_type, content = item
         IS_SPEAKING.set()
@@ -305,73 +297,78 @@ def tts_playback_worker():
                             # librosa requires a 1D floating-point array
                             audio = librosa.effects.time_stretch(y=audio, rate=current_speed)
                         play_audio(audio, sample_rate=22050)
-
         finally:
             if AUDIO_QUEUE.empty():
                 IS_SPEAKING.clear()
             AUDIO_QUEUE.task_done()
 
 # STREAMING TOKEN PARSER
+def filter_streamer(streamer):
+    """
+    Highly optimized generator that aggressively strips all periods and asterisks
+    from the token stream before they reach the parser.
+    """
+    for token in streamer:
+        # Fast path bypass: check if the token even contains our target characters
+        if '.' in token or '*' in token:
+            token = token.replace('.', '').replace('*', '')
+        # Only yield if the token isn't completely empty after replacement
+        if token:
+            yield token
+
 def stream_and_process(streamer):
     """
     Consumes tokens in realtime. Delivers the JSON section to HA the moment
     it terminates, and streams complete phrases directly to the TTS worker.
     """
-    accumulated_text = ""
     payload_dispatched = False
     active_phrase = ""
-    current_speed = 1.0
-    full_verbal_response = ""
+    full_verbal_response = []
+    streamer = filter_streamer(streamer)
     for token in streamer:
-        accumulated_text += token
-        # Detect completion of the JSON payload section
-        if not payload_dispatched and "\n\n" in accumulated_text:
-            json_part, verbal_start = accumulated_text.split("\n\n", 1)
-            print("=" * 60)
-            print("[NLU Parser] EXTRAPOLATED JSON PAYLOAD:")
-            print(json_part.strip())
-            print("=" * 60)
-            dispatch_ha_async(json_part)
-            payload_dispatched = True
-            accumulated_text = verbal_start
-            active_phrase = verbal_start
-            full_verbal_response += verbal_start
-            continue
-        if not payload_dispatched:
-            continue
         active_phrase += token
-        full_verbal_response += token
+        # Detect completion of the JSON payload section
+        if not payload_dispatched:
+            if "\n\n" in active_phrase:
+                json_part, verbal_start = active_phrase.split("\n\n", 1)
+                print("=" * 60)
+                print("[NLU Parser] EXTRAPOLATED JSON PAYLOAD:")
+                print(json_part.strip())
+                print("=" * 60)
+                dispatch_ha_async(json_part)
+                payload_dispatched = True
+                active_phrase = verbal_start
+                full_verbal_response.append(verbal_start)
+            continue
+        full_verbal_response.append(token)
         # Handle inline prosody tags as they emerge
-        tag_match = re.search(r'(<[^>]+>)', active_phrase)
-        if tag_match:
-            tag = tag_match.group(1)
-            before_tag = active_phrase[:tag_match.start()].strip()
+        match = TAG_REGEX.search(active_phrase)
+        if match:
+            tag = match.group(1)
+            # Extract everything generated before the tag
+            before_tag = active_phrase[:match.start()].strip()
+            # Flush accumulated text to TTS BEFORE executing the tag's effect
             if before_tag:
                 AUDIO_QUEUE.put(("TEXT", before_tag))
+            # Dispatch the specific instruction
             if tag == "<pause>":
-                AUDIO_QUEUE.put(("PAUSE", 0.30))
+                AUDIO_QUEUE.put(("PAUSE", 0.2))
+                AUDIO_QUEUE.put(("SPEED", 1.0))
             elif tag == "<sigh>":
                 AUDIO_QUEUE.put(("TEXT", "sigh"))
+                AUDIO_QUEUE.put(("SPEED", 0.1))
             elif tag == "<fast>":
-                current_speed = 1.20
-                AUDIO_QUEUE.put(("SPEED", current_speed))
+                AUDIO_QUEUE.put(("SPEED", 1.5))
             elif tag == "<slow_deadpan>":
-                current_speed = 0.85
-                AUDIO_QUEUE.put(("SPEED", current_speed))
-            active_phrase = active_phrase[tag_match.end():]
-            continue
-        # Stream by natural phrase boundaries for lowest Time-To-First Audio
-        if any(punct in token for punct in [".", "!", "?", ","]):
-            clean_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
-            if clean_chunk:
-                AUDIO_QUEUE.put(("TEXT", clean_chunk))
-            active_phrase = ""
-    # Flush any remaining tokens
-    final_chunk = re.sub(r'<[^>]+>', '', active_phrase).strip()
+                AUDIO_QUEUE.put(("SPEED", 0.75))
+            # Remove the processed portion from the buffer
+            active_phrase = active_phrase[match.end():]
+    # Stream Termination Flush
+    final_chunk = TAG_REGEX.sub('', active_phrase).strip()
     if final_chunk:
         AUDIO_QUEUE.put(("TEXT", final_chunk))
     print("[LLM Pipeline] STREAM COMPLETE: GLaDOS Response Summary")
-    print(f"Decoded Spoken Output: \"{full_verbal_response.strip()}\"")
+    print(f"Decoded Spoken Output: \"{''.join(full_verbal_response).strip()}\"")
     print("=" * 60 + "\n")
 
 if __name__ == "__main__":
@@ -446,7 +443,7 @@ if __name__ == "__main__":
             AUDIO_QUEUE.join()
             print("[Status] Speech completed. Recycling interface.\n" + "-" * 80)
     except KeyboardInterrupt:
-        print("=" * 80)
+        print("\n" + "=" * 80)
         print(" ORCHESTRATOR SHUTDOWN INITIATED ".center(80))
         print("=" * 80)
         AUDIO_QUEUE.put(None)
