@@ -354,19 +354,6 @@ def tts_playback_worker():
             AUDIO_QUEUE.task_done()
 
 # STREAMING TOKEN PARSER
-def filter_streamer(streamer):
-    """
-    Highly optimized generator that aggressively strips all periods and asterisks
-    from the token stream before they reach the parser.
-    """
-    for token in streamer:
-        # Fast path bypass: check if the token even contains our target characters
-        if '.' in token or '*' in token:
-            token = token.replace('.', '').replace('*', '')
-        # Only yield if the token isn't completely empty after replacement
-        if token:
-            yield token
-
 def stream_and_process(streamer):
     """
     Consumes tokens in realtime. Delivers the JSON section to HA the moment
@@ -375,11 +362,10 @@ def stream_and_process(streamer):
     payload_dispatched = False
     active_phrase = ""
     full_verbal_response = []
-    streamer = filter_streamer(streamer)
     for token in streamer:
-        active_phrase += token
         # Detect completion of the JSON payload section
         if not payload_dispatched:
+            active_phrase += token
             if "\n\n" in active_phrase:
                 json_part, verbal_start = active_phrase.split("\n\n", 1)
                 print("=" * 60)
@@ -388,10 +374,17 @@ def stream_and_process(streamer):
                 print("=" * 60)
                 dispatch_ha_async(json_part)
                 payload_dispatched = True
-                active_phrase = verbal_start
-                full_verbal_response.append(verbal_start)
+                clean_verbal_start = verbal_start.replace('.', '').replace('*', '')
+                active_phrase = clean_verbal_start
+                if clean_verbal_start:
+                    full_verbal_response.append(clean_verbal_start)
             continue
-        full_verbal_response.append(token)
+        # Aggressively filter tokens before they hit the TTS buffer
+        clean_token = token.replace('.', '').replace('*', '')
+        if not clean_token:
+            continue  # Skip processing if the token was just a dot/asterisk
+        active_phrase += clean_token
+        full_verbal_response.append(clean_token)
         # Handle inline prosody tags as they emerge
         match = TAG_REGEX.search(active_phrase)
         if match:
