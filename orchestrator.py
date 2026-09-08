@@ -9,6 +9,7 @@ import time
 import queue
 import threading
 import requests
+import difflib
 import scipy.io.wavfile as wav
 import librosa
 import numpy as np
@@ -46,40 +47,53 @@ HA_HEADERS = {
 TAG_REGEX = re.compile(r'(<[^>]+>)')
 JSON_EXTRACT_REGEX = re.compile(r'(\{.*?\})', re.DOTALL)
 # Training prompt format
+SERVICES = [
+    "cover.close_cover",
+    "cover.open_cover",
+    "cover.stop_cover",
+    "fan.decrease_speed",
+    "fan.increase_speed",
+    "fan.turn_off",
+    "fan.turn_on",
+    "light.turn_off",
+    "light.turn_on",
+    "lock.lock",
+    "lock.unlock",
+    "media_player.media_next_track",
+    "media_player.media_pause",
+    "media_player.media_play",
+    "media_player.media_previous_track",
+    "media_player.media_stop",
+    "media_player.turn_off",
+    "media_player.turn_on",
+    "media_player.volume_down",
+    "media_player.volume_mute",
+    "media_player.volume_up",
+    "timer.cancel()",
+    "timer.pause()",
+    "timer.start(duration)"
+]
+DEVICES = [
+    "cover.bathroom 'Bathroom Blinds' = open",
+    "fan.attic_ventilation 'Attic fan' = off",
+    "light.aquarium 'Aquarium Light' = off",
+    "lock.back_door 'Backyard lock' = unlocked",
+    "media_player.apple_tv 'Apple TV media player' = off",
+    "timer.bedroom_lamp_timer 'Bedroom lamp scheduler' = active",
+    "todo.birthday_reminder_list 'Birthday reminder list'"
+]
 SYSTEM_INSTRUCTION = (
     f"You are GLaDOS, an AI assistant that controls the devices in a house. "
     f"Execute the spoken command, output the required JSON payload, and respond in character. "
     f"Complete the following task as instructed or answer the following question with the information provided only.\n"
-    f"Services: cover.close_cover(), "
-    f"cover.open_cover(), cover.stop_cover(), cover.toggle(), fan.decrease_speed(), "
-    f"fan.increase_speed(), fan.toggle(), fan.turn_off(), fan.turn_on(), light.toggle(), "
-    f"light.turn_off(), light.turn_on(rgb_color,brightness), lock.lock(), lock.unlock(), "
-    f"media_player.media_next_track(), media_player.media_pause(), media_player.media_play(), "
-    f"media_player.media_play_pause(), media_player.media_previous_track(), "
-    f"media_player.media_stop(), media_player.toggle(), media_player.turn_off(), "
-    f"media_player.turn_on(), media_player.volume_down(), media_player.volume_mute(), "
-    f"media_player.volume_up(), switch.toggle(), switch.turn_off(), switch.turn_on(), "
-    f"timer.add_item(item), timer.cancel(), timer.pause(), timer.start(duration), "
-    f"vacuum.pause(), vacuum.return_to_base(), vacuum.start(), vacuum.stop()\n"
+    f"Services: {', '.join(SERVICES)}\n"
     f"Devices:\n"
-    f"climate.carrier_cor 'Carrier Cor Wi-Fi Thermostat' = auto;On High;24C;87%\n"
-    f"cover.back_window 'Back Window Blinds' = closed\n"
-    f"cover.bathroom 'Bathroom Blinds' = open\n"
-    f"fan.attic_ventilation 'Attic ventilation fan' = off\n"
-    f"fan.back_porch 'Back Porch Fan' = on\n"
-    f"light.aquarium 'Aquarium Light' = off\n"
-    f"light.attic 'Attic Light' = off\n"
-    f"lock.attic_door 'Attic Door' = unlocked\n"
-    f"lock.back_door 'Backyard entry lock' = unlocked\n"
-    f"media_player.apple_tv 'Apple TV media player' = off\n"
-    f"switch.attic_lights 'Attic Lights Switch' = off\n"
-    f"switch.balcony_lighting 'Balcony lighting control' = on\n"
-    f"timer.backyard_floodlights 'Backyard floodlight controller' = idle\n"
-    f"timer.bedroom_lamp_timer 'Bedroom lamp scheduler' = active\n"
-    f"vacuum.balcony 'Balcony' = docked\n"
-    f"todo.bill_payment_reminders 'Bill payment reminders' = 20\n"
-    f"todo.birthday_reminder_list 'Birthday reminder list' = 23"
+    f"{'\n'.join(DEVICES)}"
 )
+# Strip parameters: "timer.start(duration)" -> "timer.start"
+VALID_SERVICES = [srv.split("(")[0] for srv in SERVICES]
+# Strip friendly names and states: "cover.bathroom 'Bathroom Blinds' = open" -> "cover.bathroom"
+VALID_DEVICES = [dev.split(" ")[0] for dev in DEVICES]
 # Global Engine Handles
 GLADOS_ENGINE = None
 AUDIO_QUEUE = queue.Queue()
@@ -228,28 +242,53 @@ def is_audio_silent(filepath, threshold):
         return True
 
 # HOME ASSISTANT THREAD
+def enforce_schema(query, choices, cutoff=0.75):
+    """
+    Fuzzy semantic matcher. Scores the LLM's output against the truth schema.
+    Returns the closest valid match if confidence is above the cutoff, otherwise None.
+    """
+    if not query:
+        return None
+    matches = difflib.get_close_matches(query, choices, n=1, cutoff=cutoff)
+    return matches[0] if matches else None
+
+
 def dispatch_ha_async(payload_text):
     """
     Parses and fires the Home Assistant REST request in a dedicated daemon thread.
-    Does not block the token streaming or speech pipeline.
+    Corrects and rewrites inputs before sending to prevent API errors.
     """
     def _execute():
-        print("[HA API] Thread spawned. Extracting JSON blocks from model outputs...")
+        print("[HA API] Thread spawned. Extracting JSON blocks from model outputs.")
         matches = JSON_EXTRACT_REGEX.finditer(payload_text)
         for match in matches:
             try:
                 payload = json.loads(match.group(1))
                 if not payload:
                     continue
-                service_call = payload.get("service")
-                target_device = payload.get("target_device")
-                if not service_call or "." not in service_call:
+                raw_service = payload.get("service")
+                raw_device = payload.get("target_device")
+                # Validate and correct the service first
+                safe_service = enforce_schema(raw_service, VALID_SERVICES, cutoff=0.65)
+                if not safe_service:
+                    print(f"[RAE BLOCKED] Invalid service hallucinated: '{raw_service}'")
                     continue
-                domain, service = service_call.split(".", 1)
+                # Perform Domain Constrained Sifting to isolate target devices
+                target_domain = safe_service.split(".")[0] + "."
+                domain_constrained_devices = [dev for dev in VALID_DEVICES if dev.startswith(target_domain)]
+                # Match device against the constrained pool
+                safe_device = enforce_schema(raw_device, domain_constrained_devices, cutoff=0.60)
+                # Fallback to global pool if domain sifting yields no matches
+                if not safe_device:
+                    safe_device = enforce_schema(raw_device, VALID_DEVICES, cutoff=0.60)
+                if not safe_device:
+                    print(f"[RAE BLOCKED] Invalid target device hallucinated: '{raw_device}'")
+                    continue
+                # Map corrected values back to the execution payload
+                domain, service = safe_service.split(".", 1)
                 endpoint = f"{HA_URL}/{domain}/{service}"
-                body = {}
-                if target_device:
-                    body["entity_id"] = target_device
+                body = {"entity_id": safe_device}
+                # Package any auxiliary parameters
                 for key, val in payload.items():
                     if key not in ["service", "target_device"]:
                         body[key] = val
@@ -258,7 +297,7 @@ def dispatch_ha_async(payload_text):
                 resp = requests.post(endpoint, headers=HA_HEADERS, json=body, timeout=2.0)
                 latency = (time.perf_counter() - t0) * 1000
                 if resp.ok:
-                    print(f"[HA API OK] >> {service_call} ({latency:.1f} ms)\n")
+                    print(f"[HA API OK] >> {safe_service} ({latency:.1f} ms)\n")
                 else:
                     print(f"[HA API ERROR] >> Request failed: {resp.status_code}\n")
             except Exception as err:
