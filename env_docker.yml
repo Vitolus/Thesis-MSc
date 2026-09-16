@@ -1,0 +1,33 @@
+name: pytorch-audio
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - huggingface_hub
+  - transformers[version='>=5.12']
+  - accelerate
+  - optimum
+  - evaluate
+  - datasets
+  - scikit-learn
+  - pysoundfile
+  - librosa
+  - num2words
+  - peft
+  - trl[version='>=1.7.0']
+  - pytorch[version='>=2.12']
+  - torchaudio
+  - torchvision
+  - wandb
+  - nltk
+  - speechrecognition
+  - python-sounddevice
+  - pyaudio
+  - pip:
+      - bitsandbytes
+      - liger-kernel
+      - mistral-common[audio,hf-hub]
+      - onnxruntime-gpu
