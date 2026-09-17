@@ -76,7 +76,7 @@ SERVICES = [
 DEVICES = [
     "cover.bathroom 'Bathroom Blinds' = open",
     "fan.attic_ventilation 'Attic fan' = off",
-    "light.aquarium 'Aquarium Light' = off",
+    "light.living_room 'Living Room Light' = off",
     "lock.back_door 'Backyard lock' = unlocked",
     "media_player.apple_tv 'Apple TV media player' = off",
     "timer.bedroom_lamp_timer 'Bedroom lamp scheduler' = active",
@@ -86,6 +86,7 @@ SYSTEM_INSTRUCTION = (
     f"You are GLaDOS, an AI assistant that controls the devices in a house. "
     f"Execute the spoken command, output the required JSON payload, and respond in character. "
     f"Complete the following task as instructed or answer the following question with the information provided only.\n"
+    f"Home configuration:\n"
     f"Services: {', '.join(SERVICES)}\n"
     f"Devices:\n"
     f"{'\n'.join(DEVICES)}"
@@ -318,7 +319,10 @@ def adjust_speech_cadence(audio_array, speed_mode, sample_rate=22050):
     audio_array = np.asarray(audio_array).flatten()
     # Execute the Phase Vocoder algorithm
     # speed_mode > 1.0 makes it faster, speed_mode < 1.0 makes it slower
-    stretched_audio = librosa.effects.time_stretch(y=audio_array, rate=speed_mode)
+    stretched_audio = librosa.effects.time_stretch(y=audio_array, rate=speed_mode, n_fft=1024)
+    max_amplitude = np.max(np.abs(stretched_audio))
+    if max_amplitude > 1.0:
+        stretched_audio = stretched_audio / max_amplitude
     return stretched_audio
 
 def tts_playback_worker():
